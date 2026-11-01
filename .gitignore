@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+*.pyc
+gateway/proxy.env
+gateway/health.json
+gateway/*.log
