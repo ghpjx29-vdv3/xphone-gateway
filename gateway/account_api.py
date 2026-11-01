@@ -21,7 +21,7 @@ def account_token() -> str:
 
 def request(path: str, body: dict | None = None, token: str | None = None) -> dict:
     payload = None if body is None else json.dumps(body, separators=(",", ":")).encode()
-    headers = {"Accept": "application/json"}
+    headers = {"Accept": "application/json", "User-Agent": "XPhone-Gateway/1.0"}
     if body is not None:
         headers["Content-Type"] = "application/json"
     if token:
@@ -47,6 +47,7 @@ def mcp_call(name: str, args: dict, session_token: str, mcp_url: str) -> dict:
         "Authorization": f"Bearer {session_token}",
         "Content-Type": "application/json",
         "Accept": "application/json",
+        "User-Agent": "XPhone-Gateway/1.0",
     })
     with urllib.request.urlopen(req, timeout=60) as response:
         result = json.load(response)
