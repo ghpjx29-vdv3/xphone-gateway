@@ -4,11 +4,13 @@ import asyncio
 import json
 import os
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
 import gateway as gateway_module
 import submit_actions
+import call_mcp
 
 
 def event(cursor):
@@ -32,10 +34,14 @@ class RetainedInboxTests(unittest.TestCase):
         self.inbox_patch = patch.object(gateway_module, "INBOX", self.inbox)
         self.health_patch = patch.object(
             gateway_module, "HEALTH_PATH", os.path.join(self.tmp.name, "health.json"))
+        self.scope_patch = patch.object(
+            gateway_module, "SCOPE_PATH", os.path.join(self.tmp.name, "scope.json"))
         self.inbox_patch.start()
         self.health_patch.start()
+        self.scope_patch.start()
         self.addCleanup(self.inbox_patch.stop)
         self.addCleanup(self.health_patch.stop)
+        self.addCleanup(self.scope_patch.stop)
         self.gateway = object.__new__(gateway_module.Gateway)
         self.gateway.decrypt_envelope = lambda envelope: {"value": envelope["id"]}
 
@@ -126,6 +132,46 @@ class RetainedInboxTests(unittest.TestCase):
         self.assertEqual(len(submitted), 2)
         self.assertEqual(submitted[0], submitted[1])
         self.assertEqual(submitted[0][0], first)
+
+    def test_call_mcp_tool_invocation_and_session_caching(self):
+        fake_sess = {
+            "token": "tok123",
+            "mcpUrl": "https://worker.dev/mcp",
+            "scope": {"packId": "p1", "playthroughId": "pt1"},
+            "expiresAt": int((time.time() + 3600) * 1000),
+        }
+        called = []
+
+        def mock_mcp(name, args, token, url):
+            called.append((name, args, token, url))
+            return {"content": [{"type": "text", "text": "{\"claimed\": true}"}]}
+
+        session_cache = os.path.join(self.tmp.name, "session.json")
+        scope_file = os.path.join(self.tmp.name, "scope.json")
+        with open(scope_file, "w") as f:
+            json.dump({"scope": {"packId": "p1", "playthroughId": "pt1"}}, f)
+
+        with patch.object(call_mcp, "SESSION_CACHE_PATH", session_cache), \
+             patch.object(call_mcp, "SCOPE_PATH", scope_file), \
+             patch.object(call_mcp, "session", return_value=fake_sess), \
+             patch.object(call_mcp, "account_mcp_call", side_effect=mock_mcp):
+            s1 = call_mcp.get_session()
+            self.assertEqual(s1["token"], "tok123")
+            self.assertTrue(os.path.exists(session_cache))
+
+            # Second call should read from cache without calling session()
+            with patch.object(call_mcp, "session", side_effect=RuntimeError("should not call")):
+                s2 = call_mcp.get_session()
+                self.assertEqual(s2["token"], "tok123")
+
+            # Calling CLI main with --name and --arguments
+            with patch("sys.argv", ["call_mcp.py", "call-tool", "--name", "xphone.start_event", "--arguments", "{\"eventId\":\"e1\"}"]):
+                call_mcp.main()
+
+            self.assertEqual(len(called), 1)
+            self.assertEqual(called[0][0], "xphone.start_event")
+            self.assertEqual(called[0][1], {"eventId": "e1"})
+            self.assertEqual(called[0][2], "tok123")
 
 
 if __name__ == "__main__":

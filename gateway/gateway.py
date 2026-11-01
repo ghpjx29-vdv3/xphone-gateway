@@ -63,6 +63,7 @@ class Gateway:
         self._stop = asyncio.Event()
 
     def _record_health(self) -> None:
+        os.makedirs(os.path.dirname(HEALTH_PATH), exist_ok=True)
         tmp = HEALTH_PATH + ".tmp"
         with open(tmp, "w") as f:
             json.dump({"lastSuccessfulPull": int(time.time())}, f)
@@ -71,6 +72,7 @@ class Gateway:
     def _record_scope(self, scope: dict | None, mcp_url: str | None) -> None:
         # Lets hook workers (and operators) see the current active pack
         # without minting a session themselves. Atomic write like health.
+        os.makedirs(os.path.dirname(SCOPE_PATH), exist_ok=True)
         record: dict = {"scope": None, "updatedAt": int(time.time())}
         if scope:
             record["scope"] = {
