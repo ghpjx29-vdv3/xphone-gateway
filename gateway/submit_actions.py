@@ -12,17 +12,14 @@ import base64
 import argparse
 import json
 import os
-import subprocess
-import tempfile
 import uuid
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from account_api import session, mcp_call as account_mcp_call
 
 HOME = os.path.expanduser("~")
 KEY_PATH = os.path.join(HOME, ".config", "xphone", "content.key")
-MCP_CLIENT = os.path.join(
-    HOME, "workspace", "custom-connectors",
-    "custom.xphone-agent-worker", "bin", "client.py")
+_session = None
 
 
 def b64u(b: bytes) -> str:
@@ -34,24 +31,18 @@ def b64u_dec(s: str) -> bytes:
 
 
 def mcp_call(name: str, args: dict, timeout: int = 60) -> dict:
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".json",
-                                     delete=False) as f:
-        json.dump(args, f)
-        p = f.name
-    try:
-        r = subprocess.run(
-            ["python3", MCP_CLIENT, "call-tool", "--name", name,
-             "--arguments-file", p],
-            capture_output=True, text=True, timeout=timeout)
-    finally:
-        os.unlink(p)
-    if r.returncode != 0:
-        raise RuntimeError(f"MCP {name} failed: {r.stderr.strip()[:300]}")
-    return json.loads(r.stdout)
+    global _session
+    if _session is None:
+        _session = session()
+    return account_mcp_call(name, args, _session["token"], _session["mcpUrl"])
 
 
 def submit_batch(actions: list, pack_id: str, playthrough_id: str,
                  batch_id: str | None = None) -> str:
+    global _session
+    _session = session()
+    if _session["scope"]["packId"] != pack_id or _session["scope"]["playthroughId"] != playthrough_id:
+        raise RuntimeError("requested pack is not active")
     key = b64u_dec(open(KEY_PATH).read().strip())
     aesgcm = AESGCM(key)
     batch_id = batch_id or str(uuid.uuid4())

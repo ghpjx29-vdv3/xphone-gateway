@@ -94,6 +94,9 @@ class RetainedInboxTests(unittest.TestCase):
         self.gateway.pull_inbox = lambda: None
         with patch.object(gateway_module, "WSClient", return_value=socket), patch.object(
             gateway_module, "PING_INTERVAL", 0.01
+        ), patch.object(gateway_module, "active_scope", return_value={"packId": "pack"}), patch.object(
+            gateway_module, "session", return_value={"token": "token", "mcpUrl": "https://worker.example/mcp",
+                                                    "scope": {"packId": "pack"}, "expiresAt": 9999999999999}
         ):
             with self.assertRaises(gateway_module.WSClientError):
                 asyncio.run(self.gateway.run_once())

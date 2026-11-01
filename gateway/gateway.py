@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
-"""XPhone Gateway: persistent WebSocket client for xphone-agent-worker.
+"""XPhone Gateway: follow the current account pack with an outbound WebSocket.
 
 Loop:
-  1. Mint a one-time ticket via MCP xphone.open_event_stream.
-  2. Connect to the agent WebSocket with subprotocol xphone-agent-ticket.<ticket>.
-  3. On envelope notifications, pull events via MCP xphone.read_inbox.
-  4. Decrypt each envelope (AES-256-GCM, content key read once at startup).
-  5. Write one JSON file per event to ~/xphone/inbox/<event-id>.json.
-  6. A hook watches the inbox dir and wakes a worker per new file.
+  1. Exchange the account token for a short-lived current-pack session.
+  2. Mint a one-time ticket via MCP xphone.open_event_stream.
+  3. Connect to the agent WebSocket with subprotocol xphone-agent-ticket.<ticket>.
+  4. On envelope notifications, pull events via MCP xphone.read_inbox.
+  5. Decrypt each envelope (AES-256-GCM, content key read once at startup).
+  6. Write one JSON file per event to ~/xphone/inbox/<event-id>.json.
+  7. A hook watches the inbox dir and wakes a worker per new file.
 
 Secrets: the content key is read once from ~/.config/xphone/content.key (0600)
-into memory. The MCP bearer token is never handled here; MCP calls go through
-the vetted connector client which uses the vault surrogate. Nothing secret is
+into memory. The account token is read by account_api from Secure Vault or a
+0600 local file; pack session tokens stay in memory. Nothing secret is
 logged: logs carry event ids, cursors and routes only, never key material,
 tickets or decrypted content.
 """
@@ -22,31 +23,23 @@ import json
 import logging
 import os
 import signal
-import subprocess
 import sys
-import tempfile
 import time
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from wsclient import WSClient, WSClientError
+from account_api import active_scope, session, mcp_call as account_mcp_call
 
 HOME = os.path.expanduser("~")
 BASE = os.path.join(HOME, "xphone")
 INBOX = os.path.join(BASE, "inbox")
 HEALTH_PATH = os.path.join(BASE, "gateway", "health.json")
 KEY_PATH = os.path.join(HOME, ".config", "xphone", "content.key")
-MCP_CLIENT = os.path.join(
-    HOME, "workspace", "custom-connectors",
-    "custom.xphone-agent-worker", "bin", "client.py",
-)
-WS_HOST = "xphone-agent-worker.xphone-maps-gateway.workers.dev"
-WS_URL_TMPL = f"wss://{WS_HOST}/agent/ws?connection={{connection}}"
 USER_AGENT = "XPhone-Gateway/1.0"
 
 PING_INTERVAL = 30
 POLL_INTERVAL = 60
 RECONNECT_BACKOFF = [5, 10, 30, 60]
-MCP_TIMEOUT = 60
 
 log = logging.getLogger("xphone-gateway")
 
@@ -75,23 +68,7 @@ class Gateway:
         os.replace(tmp, HEALTH_PATH)
 
     def mcp_call(self, name: str, args: dict):
-        """Call one MCP tool via the vetted connector client. Returns parsed result."""
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".json", delete=False
-        ) as f:
-            json.dump(args, f)
-            args_path = f.name
-        try:
-            proc = subprocess.run(
-                ["python3", MCP_CLIENT, "call-tool",
-                 "--name", name, "--arguments-file", args_path],
-                capture_output=True, text=True, timeout=MCP_TIMEOUT,
-            )
-        finally:
-            os.unlink(args_path)
-        if proc.returncode != 0:
-            raise RuntimeError(f"MCP {name} failed: {proc.stderr.strip()[:300]}")
-        return json.loads(proc.stdout)
+        return account_mcp_call(name, args, self.session_token, self.mcp_url)
 
     def decrypt_envelope(self, envelope: dict) -> dict:
         nonce = b64u_decode(envelope["nonce"])
@@ -156,13 +133,27 @@ class Gateway:
         self._record_health()
 
     async def run_once(self) -> None:
+        scope = await asyncio.to_thread(active_scope)
+        if not scope:
+            log.info("normal phone mode active; waiting for an Agent pack")
+            self._record_health()
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=POLL_INTERVAL)
+            except asyncio.TimeoutError:
+                pass
+            return
+        pack_session = await asyncio.to_thread(session)
+        self.session_token = pack_session["token"]
+        self.mcp_url = pack_session["mcpUrl"]
+        self.scope = pack_session["scope"]
+        session_expires_at = pack_session["expiresAt"]
         log.info("minting event stream ticket")
         res = self.mcp_call("xphone.open_event_stream", {})
         text = res["content"][0]["text"]
         data = json.loads(text)
         ticket = data["ticket"]
         connection = data["connection"]
-        url = WS_URL_TMPL.format(connection=connection)
+        url = self.mcp_url.replace("https://", "wss://").replace("/mcp", "/agent/ws") + f"?connection={connection}"
         proxy_url = (os.environ.get("https_proxy")
                      or os.environ.get("HTTPS_PROXY"))
         log.info("connecting websocket")
@@ -180,6 +171,9 @@ class Gateway:
             last_pull = time.monotonic()
             awaiting_pong = False
             while not self._stop.is_set():
+                if int(time.time() * 1000) + 60_000 >= session_expires_at or await asyncio.to_thread(active_scope) != self.scope:
+                    log.info("active pack changed; reconnecting")
+                    break
                 try:
                     msg = await asyncio.wait_for(ws.recv_text(),
                                                  timeout=PING_INTERVAL)
