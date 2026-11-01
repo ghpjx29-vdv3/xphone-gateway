@@ -34,6 +34,7 @@ HOME = os.path.expanduser("~")
 BASE = os.path.join(HOME, "xphone")
 INBOX = os.path.join(BASE, "inbox")
 HEALTH_PATH = os.path.join(BASE, "gateway", "health.json")
+SCOPE_PATH = os.path.join(BASE, "gateway", "scope.json")
 KEY_PATH = os.path.join(HOME, ".config", "xphone", "content.key")
 USER_AGENT = "XPhone-Gateway/1.0"
 
@@ -66,6 +67,22 @@ class Gateway:
         with open(tmp, "w") as f:
             json.dump({"lastSuccessfulPull": int(time.time())}, f)
         os.replace(tmp, HEALTH_PATH)
+
+    def _record_scope(self, scope: dict | None, mcp_url: str | None) -> None:
+        # Lets hook workers (and operators) see the current active pack
+        # without minting a session themselves. Atomic write like health.
+        record: dict = {"scope": None, "updatedAt": int(time.time())}
+        if scope:
+            record["scope"] = {
+                "packId": scope.get("packId"),
+                "playthroughId": scope.get("playthroughId"),
+                "xphoneSha256": scope.get("xphoneSha256"),
+                "mcpUrl": mcp_url,
+            }
+        tmp = SCOPE_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(record, f, ensure_ascii=False)
+        os.replace(tmp, SCOPE_PATH)
 
     def mcp_call(self, name: str, args: dict):
         return account_mcp_call(name, args, self.session_token, self.mcp_url)
@@ -137,6 +154,7 @@ class Gateway:
         if not scope:
             log.info("normal phone mode active; waiting for an Agent pack")
             self._record_health()
+            self._record_scope(None, None)
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=POLL_INTERVAL)
             except asyncio.TimeoutError:
@@ -146,6 +164,7 @@ class Gateway:
         self.session_token = pack_session["token"]
         self.mcp_url = pack_session["mcpUrl"]
         self.scope = pack_session["scope"]
+        self._record_scope(self.scope, self.mcp_url)
         session_expires_at = pack_session["expiresAt"]
         log.info("minting event stream ticket")
         res = self.mcp_call("xphone.open_event_stream", {})
