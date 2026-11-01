@@ -108,7 +108,12 @@ class Gateway:
             dest = os.path.join(INBOX, f"{event_id}.json")
             if os.path.exists(dest):
                 continue
-            decrypted = self.decrypt_envelope(envelope)
+            try:
+                decrypted = self.decrypt_envelope(envelope)
+            except Exception as error:
+                log.error("decrypt blocked: event=%s cursor=%s error=%s",
+                          event_id, cursor, type(error).__name__)
+                raise
             aad = json.loads(b64u_decode(envelope["aad"]).decode("utf-8"))
             record = {
                 "id": event_id,
