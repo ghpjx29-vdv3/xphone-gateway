@@ -132,6 +132,41 @@ class Gateway:
             log.info("inbox write: event=%s cursor=%s route=%s",
                      event_id, cursor,
                      (record["route"] or {}).get("role"))
+            self.trigger_worker(record)
+
+    def trigger_worker(self, record: dict) -> None:
+        decrypted = record.get("decrypted") or {}
+        event_type = decrypted.get("type", "")
+        if event_type in ("app.foreground", "app.background"):
+            return
+
+        worker_py = os.environ.get("XPHONE_WORKER_SCRIPT") or os.path.join(BASE, "gateway", "inbox_worker.py")
+        if not os.path.exists(worker_py):
+            hatch_py = "/home/hatch/xphone/gateway/inbox_worker.py"
+            if os.path.exists(hatch_py):
+                worker_py = hatch_py
+            else:
+                return
+
+        worker_bin = os.environ.get("XPHONE_WORKER_PYTHON") or os.path.join(BASE, "gateway", ".venv", "bin", "python")
+        if not os.path.exists(worker_bin):
+            hatch_bin = "/home/hatch/xphone/gateway/.venv/bin/python"
+            if os.path.exists(hatch_bin):
+                worker_bin = hatch_bin
+            else:
+                worker_bin = sys.executable
+
+        try:
+            import subprocess
+            subprocess.Popen(
+                [worker_bin, worker_py],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            log.info("worker triggered (Scheme 1): %s %s", worker_bin, worker_py)
+        except Exception as error:
+            log.error("failed to trigger worker: %s", error)
 
     def pull_inbox(self) -> None:
         # The Worker removes only acked entries. Re-scan retained entries on
