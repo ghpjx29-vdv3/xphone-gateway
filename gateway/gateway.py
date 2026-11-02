@@ -67,6 +67,8 @@ class Gateway:
         self.muse_dispatch = (MuseDispatch(INBOX, os.path.join(BASE, "gateway", "muse-dispatch.json"))
                               if PROVIDER == "muse" else None)
         self._dispatch_lock = threading.Lock()
+        self._dispatch_cancel = threading.Event()
+        self._dispatch_pending = False
         self._stop = asyncio.Event()
 
     def _record_health(self) -> None:
@@ -195,24 +197,30 @@ class Gateway:
             if new_cursor <= cursor:
                 break
             cursor = new_cursor
-        if PROVIDER == "muse" and getattr(self, "muse_dispatch", None) and getattr(self, "scope", None):
-            try:
+        if PROVIDER == "muse" and self.muse_dispatch and self.scope and retained:
+            if not self._dispatch_lock.acquire(blocking=False):
+                self._dispatch_pending = True
+                return
+            token, url, scope = self.session_token, self.mcp_url, self.scope.copy()
+            cancel = threading.Event()
+            self._dispatch_cancel = cancel
+            self._dispatch_pending = False
+
+            def dispatch_retained() -> None:
                 try:
                     self.muse_dispatch.dispatch(
                         retained,
-                        self.mcp_call,
-                        self.scope["playthroughId"],
-                        pack_id=self.scope.get("packId"),
-                        key_bytes=getattr(self, "key", None),
+                        lambda name, args: account_mcp_call(name, args, token, url),
+                        scope["playthroughId"], pack_id=scope["packId"], cancel=cancel,
                     )
-                except TypeError:
-                    self.muse_dispatch.dispatch(
-                        retained,
-                        self.mcp_call,
-                        self.scope["playthroughId"],
-                    )
-            except Exception as error:
-                log.warning("muse dispatch deferred: error=%s", type(error).__name__)
+                except Exception as error:
+                    log.warning("muse dispatch deferred: error=%s", type(error).__name__)
+                finally:
+                    self._dispatch_lock.release()
+                    if self._dispatch_pending and not cancel.is_set():
+                        self.pull_inbox()
+
+            threading.Thread(target=dispatch_retained, daemon=True).start()
         self._record_health()
 
     async def run_once(self) -> None:
@@ -298,6 +306,8 @@ class Gateway:
                 else:
                     log.debug("unhandled message type: %s", mtype)
         finally:
+            if PROVIDER == "muse":
+                self._dispatch_cancel.set()
             await ws.close()
 
     async def run(self) -> None:

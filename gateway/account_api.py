@@ -37,7 +37,7 @@ def active_scope() -> dict | None:
 
 
 def session() -> dict:
-    return request("/account/session", {}, account_token())
+    return request("/account/gateway-session", {}, account_token())
 
 
 def mcp_call(name: str, args: dict, session_token: str, mcp_url: str) -> dict:

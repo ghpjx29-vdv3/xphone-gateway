@@ -1,14 +1,18 @@
-"""Muse wake ordering, prompt building, reply submission, and lifecycle handling for retained Worker events."""
+"""Muse delivery completion and role context contracts."""
 
 import json
-import os
 import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import patch
 
-from muse_dispatch import MuseCliError, MuseDispatch
+from muse_context import MuseContext
+from muse_delivery import batch_id
+from muse_dispatch import MuseDispatch
+
+
+def result(value):
+    return {"content": [{"text": json.dumps(value)}]}
 
 
 class MuseDispatchTests(unittest.TestCase):
@@ -18,126 +22,98 @@ class MuseDispatchTests(unittest.TestCase):
         self.inbox = Path(self.tmp.name) / "inbox"
         self.inbox.mkdir()
         self.dispatcher = MuseDispatch(str(self.inbox), str(Path(self.tmp.name) / "state.json"))
-        # 32-byte test key
-        self.test_key = b"12345678901234567890123456789012"
+        self.event_id = "event-1"
+        self.item = {"cursor": 1, "envelope": {"id": self.event_id, "kind": "event"}}
+        self.record = {"id": self.event_id, "packId": "pack", "playthroughId": "play",
+                       "route": {"role": "subagent", "roleId": "messages:alice", "consumer": "messages.alice",
+                                 "targetApp": "messages", "surfaceId": "messages.dm.alice"},
+                       "decrypted": {"type": "messages.user_sent", "payload": {"actorId": "alice", "text": "hi"}}}
+        (self.inbox / f"{self.event_id}.json").write_text(json.dumps(self.record), encoding="utf-8")
+        self.calls = []
+        self.status = "unknown"
 
-    def item(self, cursor, conversation, event_type="os.user_message", text="PRIVATE_MESSAGE"):
-        event_id = f"event-{cursor}"
-        (self.inbox / f"{event_id}.json").write_text(json.dumps({
-            "id": event_id, "playthroughId": "play", "packId": "blank-pack",
-            "decrypted": {"type": event_type, "payload": {"conversationId": conversation, "text": text}},
-            "route": {"role": "os-agent", "roleId": "os"},
-        }))
-        return {"cursor": cursor, "envelope": {"id": event_id, "kind": "event"}}
+    def mcp(self, name, args):
+        self.calls.append((name, args))
+        if name == "xphone.get_event_status":
+            return result({"status": "accepted"})
+        if name == "xphone.start_event":
+            return result({"status": "running", "claimed": True, "leaseId": "lease"})
+        if name == "xphone.get_delivery":
+            return result({"status": self.status})
+        return result({"ok": True})
 
-    def test_one_event_at_a_time_and_end_to_end_submit(self):
-        # New architecture: side chat submits via connector directly;
-        # gateway only manages lease (start/finish/ack), no submit_action_batch.
-        items = [self.item(1, "first", text="hello muse"), self.item(2, "second", text="second msg")]
-        statuses = {"event-1": "accepted", "event-2": "accepted"}
-        sent = []
-        mcp_calls = []
-
-        def mcp(name, args):
-            mcp_calls.append((name, args))
-            if name == "xphone.get_event_status":
-                return {"content": [{"text": json.dumps({"status": statuses[args["eventId"]]})}]}
-            elif name == "xphone.start_event":
-                return {"content": [{"text": json.dumps({"status": "running", "leaseId": f"lease-{args['eventId']}"})}]}
-            elif name == "xphone.finish_event":
-                statuses[args["eventId"]] = "completed"
-                return {"content": [{"text": json.dumps({"ok": True})}]}
-            elif name == "xphone.ack_inbox":
-                return {"content": [{"text": json.dumps({"ok": True})}]}
-            return {"content": [{"text": "{}"}]}
+    def test_applied_batch_completes_without_structured_reply(self):
+        batch = batch_id("pack", "play", self.event_id)
+        self.dispatcher.context.prompt = lambda *_, **__: "prompt"
 
         def cli(*args):
             if args[0] == "session-start":
-                return {"session_id": f"session-{len(sent) + 1}"}
-            sent.append(args)
-            return {"sent": True, "reply": {"text": "收到你的测试消息！"}}
+                return {"session_id": "sidechat"}
+            if args[0] == "send":
+                self.assertIn("--thread", args)
+                self.status = "applied"
+                return {"sent": True, "reply": {"text": "角色已回复。"}}
+            raise AssertionError(args)
 
         self.dispatcher.cli = cli
-        with patch("muse_dispatch.time.time", return_value=1000):
-            self.dispatcher.dispatch(items, mcp, "play", pack_id="blank-pack", key_bytes=self.test_key)
-            self.assertEqual(len(sent), 1)
-            # Check prompt contains the message text
-            self.assertIn("hello muse", sent[0][1])
-            self.assertEqual(sent[0][4], "--wait")
-            self.assertEqual(sent[0][5], "60")
-            # Verify event-1 finished and removed
-            self.assertFalse((self.inbox / "event-1.json").exists())
-            self.assertTrue((self.inbox / "event-2.json").exists())
-            # Gateway must NOT submit via MCP; side chat does it via connector
-            called_names = [c[0] for c in mcp_calls]
-            self.assertNotIn("xphone.submit_action_batch", called_names)
-
-            # Now dispatch again; event-2 should be processed
-            self.dispatcher.dispatch(items, mcp, "play", pack_id="blank-pack", key_bytes=self.test_key)
-            self.assertEqual(len(sent), 2)
-            self.assertIn("second msg", sent[1][1])
-            self.assertFalse((self.inbox / "event-2.json").exists())
-
-    def test_lifecycle_event_auto_finishes_and_acks_without_ai(self):
-        item = self.item(1, "sys", event_type="app.foreground", text="")
-        sent = []
-        mcp_calls = []
-
-        def mcp(name, args):
-            mcp_calls.append((name, args))
-            if name == "xphone.get_event_status":
-                return {"content": [{"text": json.dumps({"status": "accepted"})}]}
-            elif name == "xphone.start_event":
-                return {"content": [{"text": json.dumps({"status": "running", "leaseId": "lease-fg"})}]}
-            elif name == "xphone.finish_event":
-                return {"content": [{"text": json.dumps({"ok": True})}]}
-            elif name == "xphone.ack_inbox":
-                return {"content": [{"text": json.dumps({"ok": True})}]}
-            return {"content": [{"text": "{}"}]}
-
-        def cli(*args):
-            sent.append(args)
-            return {"sent": True}
-
-        self.dispatcher.cli = cli
-        self.dispatcher.dispatch([item], mcp, "play", pack_id="blank-pack", key_bytes=self.test_key)
-        # Should not call cli at all!
-        self.assertEqual(len(sent), 0)
-        # Should call start_event, finish_event, ack_inbox
-        called_names = [call[0] for call in mcp_calls]
-        self.assertIn("xphone.start_event", called_names)
-        self.assertIn("xphone.finish_event", called_names)
-        self.assertIn("xphone.ack_inbox", called_names)
+        self.dispatcher.dispatch([self.item], self.mcp, "play", pack_id="pack")
+        self.assertEqual([name for name, _ in self.calls if name == "xphone.finish_event"], ["xphone.finish_event"])
+        self.assertEqual([args["batchId"] for name, args in self.calls if name == "xphone.get_delivery"], [batch, batch])
         self.assertFalse((self.inbox / "event-1.json").exists())
+        view = self.dispatcher.memory.view("pack", "play", self.record["route"])
+        self.assertEqual(view["surface"], "角色已回复。")
+        self.assertEqual(view["ledger"][0]["source"], "reply_text")
 
-    def test_vm_failure_uses_backoff_without_losing_event(self):
-        items = [self.item(1, "first")]
-        calls = []
+    def test_unknown_delivery_keeps_event_and_backoff(self):
+        self.dispatcher.context.prompt = lambda *_, **__: "prompt"
+        self.dispatcher.cli = lambda *args: ({"session_id": "sidechat"} if args[0] == "session-start"
+                                      else {"sent": True, "reply": {"text": "done"}})
+        with patch("muse_dispatch.DELIVERY_WAIT_SECONDS", 0):
+            self.dispatcher.dispatch([self.item], self.mcp, "play", pack_id="pack")
+        self.assertTrue((self.inbox / "event-1.json").exists())
+        self.assertFalse(any(name == "xphone.finish_event" for name, _ in self.calls))
+        self.assertEqual(self.dispatcher.state["events"][self.event_id]["failures"], 1)
 
-        def cli(*args):
-            if args[0] == "session-start":
-                return {"session_id": "s1"}
-            calls.append(args)
-            raise MuseCliError(args[0], 1)
+    def test_rejected_batch_advances_to_new_deterministic_step(self):
+        self.status = "rejected"
+        self.dispatcher.dispatch([self.item], self.mcp, "play", pack_id="pack")
+        attempt = self.dispatcher.state["events"][self.event_id]
+        self.assertEqual(attempt["step"], 1)
+        self.assertEqual(attempt["rejectedBatchId"], batch_id("pack", "play", self.event_id))
+        self.assertFalse(any(name == "xphone.finish_event" for name, _ in self.calls))
+        attempt["nextAt"] = 0
+        self.status = "applied"
+        self.dispatcher.dispatch([self.item], self.mcp, "play", pack_id="pack")
+        batches = [args["batchId"] for name, args in self.calls if name == "xphone.get_delivery"]
+        self.assertEqual(batches[-1], batch_id("pack", "play", self.event_id, 1))
+        self.assertTrue(any(name == "xphone.finish_event" for name, _ in self.calls))
 
-        self.dispatcher.cli = cli
-        mcp = lambda name, _args: {"content": [{"text": '{"status":"accepted","leaseId":"l1"}'}]}
-        with patch("muse_dispatch.time.time", return_value=1000):
-            self.dispatcher.dispatch(items, mcp, "play", pack_id="blank-pack", key_bytes=self.test_key)
-            self.dispatcher.dispatch(items, mcp, "play", pack_id="blank-pack", key_bytes=self.test_key)
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(self.dispatcher.state["events"]["event-1"]["nextAt"], 1030)
-        with patch("muse_dispatch.time.time", return_value=1031):
-            self.dispatcher.dispatch(items, mcp, "play", pack_id="blank-pack", key_bytes=self.test_key)
-        self.assertEqual(len(calls), 2)
-        self.assertEqual(self.dispatcher.state["events"]["event-1"]["nextAt"], 1091)
+    def test_lifecycle_finishes_without_muse(self):
+        self.record["decrypted"]["type"] = "app.foreground"
+        (self.inbox / "event-1.json").write_text(json.dumps(self.record), encoding="utf-8")
+        self.dispatcher.cli = lambda *_: self.fail("Muse should not start")
+        self.dispatcher.dispatch([self.item], self.mcp, "play", pack_id="pack")
+        self.assertTrue(any(name == "xphone.finish_event" for name, _ in self.calls))
 
-    def test_cli_routes_wss_through_https_proxy(self):
-        with patch.dict(os.environ, {"https_proxy": "http://proxy:8080", "wss_proxy": ""}, clear=True), patch(
-            "muse_dispatch.subprocess.run", return_value=SimpleNamespace(returncode=0, stdout='{"sent":true}')
-        ) as run:
-            self.dispatcher.cli("status")
-        self.assertEqual(run.call_args.kwargs["env"]["wss_proxy"], "http://proxy:8080")
+    def test_subagent_prompt_has_only_its_action_and_reference_index(self):
+        def mcp(name, args):
+            if name == "runtime.list_assets":
+                return result({"version": "1", "paths": ["content/config/agent-prompts/subagents/messages.md"]})
+            if name == "runtime.read_asset":
+                return result({"content": "Worker role prompt: {{knownInformation}}"})
+            if name == "xphone.list_app_actions":
+                return result({"actions": [{"type": "messages.append", "role": "messages subagent"},
+                                           {"type": "characters.create", "role": "os-agent"}]})
+            if name == "story.get_context":
+                self.assertEqual(args, {"eventId": "event-1", "consumer": "messages.alice"})
+                return result({"references": [{"id": "alice", "title": "Alice", "summary": "角色资料"}]})
+            raise AssertionError(name)
+
+        prompt = MuseContext().prompt(self.record, "pack", "play", "batch", {}, mcp)
+        self.assertIn("messages.append", prompt)
+        self.assertIn("Worker role prompt", prompt)
+        self.assertIn("角色资料", prompt)
+        self.assertNotIn("characters.create", prompt)
 
 
 if __name__ == "__main__":

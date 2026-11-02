@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import tempfile
+import threading
 import time
 import unittest
 from types import SimpleNamespace
@@ -45,6 +46,9 @@ class RetainedInboxTests(unittest.TestCase):
         self.addCleanup(self.scope_patch.stop)
         self.gateway = object.__new__(gateway_module.Gateway)
         self.gateway.decrypt_envelope = lambda envelope: {"value": envelope["id"]}
+        self.gateway._dispatch_lock = threading.Lock()
+        self.gateway._dispatch_cancel = threading.Event()
+        self.gateway._dispatch_pending = False
 
     def test_deleted_unacked_file_is_restored_on_next_pull(self):
         calls = []
@@ -65,19 +69,24 @@ class RetainedInboxTests(unittest.TestCase):
 
     def test_muse_provider_dispatches_after_inbox_persist(self):
         item = event(1)
-        self.gateway.scope = {"playthroughId": "play"}
+        self.gateway.scope = {"playthroughId": "play", "packId": "pack"}
+        self.gateway.session_token = "token"
+        self.gateway.mcp_url = "https://worker.example/mcp"
         self.gateway.mcp_call = lambda _name, args: {
             "content": [{"text": json.dumps({"items": [item] if args["cursor"] == 0 else []})}]
         }
         dispatched = []
+        done = threading.Event()
 
-        def dispatch(items, _mcp_call, playthrough_id):
+        def dispatch(items, _mcp_call, playthrough_id, **kwargs):
             self.assertTrue(os.path.exists(os.path.join(self.inbox, "event-1.json")))
             dispatched.append((items, playthrough_id))
+            done.set()
 
         self.gateway.muse_dispatch = SimpleNamespace(dispatch=dispatch)
         with patch.object(gateway_module, "PROVIDER", "muse"):
             self.gateway.pull_inbox()
+        self.assertTrue(done.wait(2))
         self.assertEqual(dispatched, [([item], "play")])
 
     def test_bad_first_envelope_does_not_skip_later_events(self):

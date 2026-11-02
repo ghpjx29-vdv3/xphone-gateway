@@ -1,20 +1,21 @@
-"""Send retained XPhone inbox events to dedicated Muse side chats, collect replies, and submit actions via MCP."""
+"""Dispatch retained XPhone events into role-specific Muse side chats."""
 
 import json
 import logging
 import os
-import re
 import subprocess
+import threading
 import time
-import uuid
 from pathlib import Path
 
+from muse_context import MuseContext, tool_data
+from muse_delivery import batch_id, delivery_status
+from muse_memory import MuseMemory
 
 log = logging.getLogger("xphone-gateway")
-RETRY_SECONDS = 60
-MAX_BACKOFF_SECONDS = 600
 EVENT_LEASE_SECONDS = 90
 MUSE_WAIT_SECONDS = 60
+DELIVERY_WAIT_SECONDS = 120
 
 
 class MuseCliError(Exception):
@@ -25,17 +26,51 @@ class MuseCliError(Exception):
         self.reason = reason
 
 
+class LeaseRenewal:
+    def __init__(self, mcp_call, event_id: str, lease_id: str, cancel: threading.Event | None):
+        self.mcp_call, self.event_id, self.lease_id = mcp_call, event_id, lease_id
+        self.cancel = cancel
+        self.stop_signal = threading.Event()
+        self.lost = False
+        self.thread = threading.Thread(target=self.run, daemon=True)
+
+    def run(self) -> None:
+        next_at = time.monotonic() + 30
+        while not self.stop_signal.wait(1):
+            if self.cancel and self.cancel.is_set():
+                return
+            if time.monotonic() < next_at:
+                continue
+            try:
+                self.mcp_call("xphone.renew_event", {"eventId": self.event_id, "leaseId": self.lease_id})
+                next_at = time.monotonic() + 30
+            except Exception:
+                self.lost = True
+                log.warning("muse lease renewal lost: event=%s", self.event_id)
+                return
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *_):
+        self.stop_signal.set()
+        self.thread.join()
+
+
 class MuseDispatch:
     def __init__(self, inbox: str, state_path: str):
-        self.inbox = Path(inbox)
-        self.state_path = Path(state_path)
-        self.state = json.loads(self.state_path.read_text()) if self.state_path.exists() else {
+        self.inbox, self.state_path = Path(inbox), Path(state_path)
+        self.state = json.loads(self.state_path.read_text(encoding="utf-8")) if self.state_path.exists() else {
             "sessions": {}, "events": {},
         }
+        self.memory = MuseMemory(str(self.state_path.with_name("muse-memory.json")))
+        self.context = MuseContext()
 
     def save(self) -> None:
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.state_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self.state, ensure_ascii=False))
+        tmp.write_text(json.dumps(self.state, ensure_ascii=False), encoding="utf-8")
         os.replace(tmp, self.state_path)
 
     def cli(self, *args: str) -> dict:
@@ -43,237 +78,151 @@ class MuseDispatch:
         proxy = env.get("wss_proxy") or env.get("WSS_PROXY") or env.get("https_proxy") or env.get("HTTPS_PROXY")
         if proxy:
             env["wss_proxy"] = proxy
-        operation = args[0]
         cli_bin = env.get("XPHONE_MUSE_CLI")
         if not cli_bin or not os.path.exists(cli_bin):
-            candidates = [
-                os.path.expanduser("~/.local/bin/muse-cli"),
-                "/home/hatch/.local/bin/muse-cli",
-            ]
-            for c in candidates:
-                if os.path.exists(c):
-                    cli_bin = c
-                    break
-        if not cli_bin:
-            cli_bin = "muse-cli"
-
+            cli_bin = next((path for path in [os.path.expanduser("~/.local/bin/muse-cli"),
+                                              "/home/hatch/.local/bin/muse-cli"] if os.path.exists(path)), "muse-cli")
         try:
-            result = subprocess.run(
-                [cli_bin, *args],
-                capture_output=True, text=True, timeout=90, env=env,
-            )
+            result = subprocess.run([cli_bin, *args], capture_output=True, text=True, timeout=90, env=env)
         except (OSError, subprocess.TimeoutExpired) as error:
-            raise MuseCliError(operation, reason=type(error).__name__) from error
+            raise MuseCliError(args[0], reason=type(error).__name__) from error
         if result.returncode:
-            raise MuseCliError(operation, result.returncode)
+            raise MuseCliError(args[0], result.returncode)
         try:
             return json.loads(result.stdout)
         except json.JSONDecodeError as error:
-            raise MuseCliError(operation, reason="invalid-json") from error
+            raise MuseCliError(args[0], reason="invalid-json") from error
 
-    def conversation_id(self, record: dict) -> str:
-        decrypted = record.get("decrypted") or {}
-        payload = decrypted.get("payload") or {}
-        if payload.get("conversationId"):
-            return payload["conversationId"]
-        route = record.get("route") or {}
-        playthrough = record["playthroughId"]
-        if route.get("role") == "os-agent":
-            return f"{playthrough}:os-agent:ops"
-        return f"{playthrough}:{route.get('roleId') or 'system'}"
+    def session_key(self, record: dict) -> tuple[str, bool]:
+        route = record["route"]
+        scope = f"{record['packId']}:{record['playthroughId']}"
+        if route["role"] == "os-agent" and record["decrypted"].get("type") != "os.user_message":
+            return f"{scope}:ops:{record['id']}", True
+        return f"{scope}:{route['roleId']}", False
 
-    def session_id(self, conversation_id: str) -> str:
+    def session_id(self, key: str) -> str:
         sessions = self.state["sessions"]
-        if conversation_id not in sessions:
-            result = self.cli("session-start", "--title", f"XPhone {conversation_id}")
-            sessions[conversation_id] = result.get("session_id") or result["id"]
+        if key not in sessions:
+            result = self.cli("session-start", "--title", f"XPhone {key}")
+            sessions[key] = result.get("session_id") or result["id"]
             self.save()
-            log.info("muse session created: conversation=%s", conversation_id)
-        return sessions[conversation_id]
+            log.info("muse session created: key=%s", key)
+        return sessions[key]
 
-    def build_prompt(self, record: dict, pack_id: str, playthrough_id: str) -> str:
-        decrypted = record.get("decrypted") or {}
-        event_type = decrypted.get("type", "")
-        payload = decrypted.get("payload") or {}
-        route = record.get("route") or {}
-        role = route.get("role", "os-agent")
-        lines = [
-            f"收到 XPhone 客户端事件 (角色: {role}, 类型: {event_type}):",
-        ]
-        text = payload.get("text") or decrypted.get("text") or payload.get("content")
-        if text:
-            lines.append(f"用户/系统内容: {text}")
-        lines.append(f"详细负载: {json.dumps(payload, ensure_ascii=False)}")
-        lines.append(
-            "\n"
-            "\n你正在作为 XPhone 系统的伴侣 Agent 操纵用户的虚拟手机。你有直接调用 MCP 的能力。"
-            "\n\n当用户请求执行手机系统动作时（如创建角色、发社交动态、私信、地图定位等），"
-            "你通过 custom.xphone-agent-worker 连接器直接提交，不要只在回复里用文字声称“已完成”。"
-            "\n\n操作步骤："
-            "\n1. 用 muse.connector_search 找到 custom.xphone-agent-worker（如果还没加载）。"
-            "\n2. 构造 action 列表。支持的类型（16 种）："
-            '\n   os-agent (contacts):'
-            '\n   - {"type": "characters.create", "actorId": "英文ID", "name": "名", "description": "人设"}'
-            '\n   - {"type": "characters.update", "actorId": "已有ID", "name": "名", "description": "人设"}'
-            '\n   os-agent (photos):'
-            '\n   - {"type": "photos.import", "photoId": "唯一ID", "imageUrl": "图片URL"}'
-            '\n   os-agent (maps):'
-            '\n   - {"type": "map.replace_catalogue", "catalogue": "{city,center,zones,places}"}'
-            '\n   os-agent (messages):'
-            '\n   - {"type": "agent.reply", "messageId": "唯一ID", "text": "回复内容"}'
-            '\n   os-agent (notes):'
-            '\n   - {"type": "notes.create",...} / {"type": "notes.update",...}'
-            '\n   os-agent (world):'
-            '\n   - {"type": "world.applyStatePatch",...}'
-            '\n   messages subagent:'
-            '\n   - {"type": "messages.append", "threadId": "线程ID", "from": "发送者", "text": "内容"}'
-            '\n   maps subagent:'
-            '\n   - {"type": "map.set_actor_position", "actorId": "ID", "placeId": "地点ID", "lat": 31.23, "lng": 121.47}'
-            '\n   - {"type": "map.place_item", "itemId": "ID", "placeId": "地点ID", "name": "名"}'
-            '\n   - {"type": "map.remove_item", "itemId": "ID"}'
-            '\n   - {"type": "map.applyevent",...} / {"type": "map.set_place_image",...}'
-            '\n   socialmedia subagent:'
-            '\n   - {"type": "socialmedia.applyBatch", "actions": [{"platform": "x", "operation": "appendPost", "postId": "ID", "authorName": "名", "text": "正文"}]}'
-            "\n3. 加密并提交："
-            "\n   - 从 ~/.config/xphone/content.key 读取 32 字节密钥（base64url）。"
-            "\n   - 用 Python + cryptography 库 AES-256-GCM 加密："
-            f"\n     packId={pack_id}, playthroughId={playthrough_id}"
-            "\n     plaintext = JSON({\"batchId\": <uuid>, \"actions\": [...]})"
-            "\n     aad = JSON({\"v\":1,\"packId\":...,\"playthroughId\":...,\"direction\":\"client\",\"kind\":\"action_batch\",\"id\":<batchId>})"
-            "\n     nonce = 12 字节随机；ciphertext = AESGCM(key).encrypt(nonce, plaintext, aad)"
-            "\n     envelope = {\"id\": batchId, \"kind\":\"action_batch\", \"version\":1,"
-            " \"nonce\": b64u(nonce), \"ciphertext\": b64u(ct), \"aad\": b64u(aad)}（b64u = base64url 去掉末尾 =）"
-            "\n   - 写 /tmp/xphone_args.json：{\"envelope\": <envelope>}"
-            "\n   - 执行：python3 ~/workspace/custom-connectors/custom.xphone-agent-worker/bin/client.py"
-            " call-tool --name xphone.submit_action_batch --arguments-file /tmp/xphone_args.json"
-            "\n4. 回复用户自然语言总结执行结果，在回复里输出 JSON 代码块。"
-            "\n\n如果仅是普通闲聊无需变更手机数据，直接回复自然语言即可，无需调 MCP。"
-        )
-        return "\n".join(lines)
-
-    def dispatch(self, items: list, mcp_call, playthrough_id: str, pack_id: str | None = None, key_bytes: bytes | None = None) -> None:
-        pending = sorted(items, key=lambda item: item["cursor"])
-        live_ids = {item["envelope"]["id"] for item in pending}
-        for event_id, attempt in list(self.state["events"].items()):
-            if attempt["playthroughId"] == playthrough_id and event_id not in live_ids:
-                self.state["events"].pop(event_id)
-                path = self.inbox / f"{event_id}.json"
-                if path.exists():
-                    path.unlink()
+    def finish(self, item: dict, record: dict, mcp_call, lease_id: str, batches: list[str],
+               reply_text: str, source: str, key: str, temporary: bool) -> None:
+        event_id = record["id"]
+        self.memory.commit(record["packId"], record["playthroughId"], event_id,
+                           record["route"], batches, reply_text[:500], source)
+        mcp_call("xphone.finish_event", {"eventId": event_id, "leaseId": lease_id, "status": "completed"})
+        mcp_call("xphone.ack_inbox", {"cursor": item["cursor"]})
+        (self.inbox / f"{event_id}.json").unlink(missing_ok=True)
+        self.state["events"].pop(event_id, None)
+        self.save()
+        if temporary and key in self.state["sessions"]:
+            try:
+                self.cli("session-delete", self.state["sessions"][key])
+                del self.state["sessions"][key]
                 self.save()
-        for path in self.inbox.glob("*.json"):
-            record = json.loads(path.read_text())
-            if record.get("playthroughId") == playthrough_id and record["id"] not in live_ids:
-                path.unlink()
+            except Exception:
+                log.warning("muse temporary session cleanup failed: event=%s", event_id)
+        log.info("muse event completed: event=%s cursor=%s batches=%s", event_id, item["cursor"], batches)
 
-        for item in pending:
-            cursor = item.get("cursor", 0)
+    def wait_delivery(self, mcp_call, batch: str, cancel: threading.Event | None,
+                      renewal: LeaseRenewal) -> str:
+        deadline = time.monotonic() + DELIVERY_WAIT_SECONDS
+        while True:
+            if renewal.lost or (cancel and cancel.is_set()):
+                raise RuntimeError("lease or scope lost")
+            status = delivery_status(mcp_call, batch)
+            if status in ("applied", "rejected") or time.monotonic() >= deadline:
+                return status
+            if cancel:
+                cancel.wait(2)
+            else:
+                time.sleep(2)
+
+    def dispatch(self, items: list, mcp_call, playthrough_id: str, pack_id: str | None = None,
+                 cancel: threading.Event | None = None) -> None:
+        for item in sorted(items, key=lambda value: value["cursor"]):
+            if cancel and cancel.is_set():
+                return
             event_id = item["envelope"]["id"]
             path = self.inbox / f"{event_id}.json"
             if not path.exists():
-                log.warning("muse event missing local record: event=%s", event_id)
                 continue
-            record = json.loads(path.read_text())
-            if record["playthroughId"] != playthrough_id:
+            record = json.loads(path.read_text(encoding="utf-8"))
+            if record["playthroughId"] != playthrough_id or record["packId"] != pack_id:
                 return
-
-            event_pack_id = pack_id or record.get("packId") or (record.get("decrypted") or {}).get("packId")
-
             if item["envelope"]["kind"] != "event":
-                mcp_call("xphone.ack_inbox", {"cursor": cursor})
-                path.unlink(missing_ok=True)
-                self.state["events"].pop(event_id, None)
-                self.save()
-                log.info("non-event acknowledged: kind=%s cursor=%s", item["envelope"]["kind"], cursor)
+                mcp_call("xphone.ack_inbox", {"cursor": item["cursor"]})
+                path.unlink()
                 continue
-
-            response = mcp_call("xphone.get_event_status", {"eventId": event_id})
-            status = json.loads(response["content"][0]["text"])
+            status = tool_data(mcp_call, "xphone.get_event_status", {"eventId": event_id})
             if status["status"] == "completed":
-                mcp_call("xphone.ack_inbox", {"cursor": cursor})
-                path.unlink(missing_ok=True)
+                mcp_call("xphone.ack_inbox", {"cursor": item["cursor"]})
+                path.unlink()
                 self.state["events"].pop(event_id, None)
                 self.save()
-                log.info("muse event completed: event=%s cursor=%s", event_id, cursor)
                 continue
             if status["status"] == "running" and status["updatedAt"] + EVENT_LEASE_SECONDS * 1000 > time.time() * 1000:
                 return
-
-            # Lifecycle events (app.foreground, app.background)
-            decrypted = record.get("decrypted") or {}
-            event_type = decrypted.get("type", "")
-            if event_type in ("app.foreground", "app.background"):
-                try:
-                    start_res = mcp_call("xphone.start_event", {"eventId": event_id})
-                    start_data = json.loads(start_res["content"][0]["text"])
-                    lease_id = start_data.get("leaseId")
-                    if lease_id:
-                        mcp_call("xphone.finish_event", {"eventId": event_id, "leaseId": lease_id, "status": "completed"})
-                except Exception as err:
-                    log.warning("error auto-finishing lifecycle event: %s", err)
-                mcp_call("xphone.ack_inbox", {"cursor": cursor})
-                path.unlink(missing_ok=True)
-                self.state["events"].pop(event_id, None)
-                self.save()
-                log.info("muse lifecycle event auto-acked: event=%s cursor=%s", event_id, cursor)
-                continue
-
-            attempt = self.state["events"].get(event_id, {"failures": 0, "nextAt": 0})
-            now = time.time()
-            if now < attempt["nextAt"]:
+            attempt = self.state["events"].setdefault(event_id, {"failures": 0, "nextAt": 0})
+            if time.time() < attempt["nextAt"]:
                 return
-
-            # Claim lease before dispatching to Muse
+            started = tool_data(mcp_call, "xphone.start_event", {"eventId": event_id})
+            if not started.get("claimed"):
+                return
+            lease_id = started["leaseId"]
             try:
-                start_res = mcp_call("xphone.start_event", {"eventId": event_id})
-                start_data = json.loads(start_res["content"][0]["text"])
-                if start_data.get("status") == "completed":
-                    mcp_call("xphone.ack_inbox", {"cursor": cursor})
-                    path.unlink(missing_ok=True)
-                    self.state["events"].pop(event_id, None)
+                with LeaseRenewal(mcp_call, event_id, lease_id, cancel) as renewal:
+                    event_type = record["decrypted"].get("type")
+                    key, temporary = self.session_key(record)
+                    if event_type in ("app.foreground", "app.background"):
+                        self.finish(item, record, mcp_call, lease_id, [], "", "lifecycle", key, False)
+                        continue
+                    step = attempt.get("step", 0)
+                    batch = batch_id(record["packId"], playthrough_id, event_id, step)
+                    attempt.update({"playthroughId": playthrough_id, "packId": record["packId"],
+                                    "batchId": batch, "sessionKey": key})
                     self.save()
+                    current = delivery_status(mcp_call, batch)
+                    if current == "rejected":
+                        attempt.update({"step": step + 1, "rejectedBatchId": batch})
+                        self.save()
+                        raise RuntimeError("delivery rejected")
+                    if current == "unknown":
+                        session_id = self.session_id(key)
+                        prompt = self.context.prompt(record, record["packId"], playthrough_id, batch,
+                                                     self.memory.view(record["packId"], playthrough_id,
+                                                                      record["route"]), mcp_call,
+                                                     rejected_batch=attempt.get("rejectedBatchId"))
+                        result = self.cli("send", prompt, "--thread", session_id, "--wait", str(MUSE_WAIT_SECONDS))
+                        if result.get("sent") is not True:
+                            raise MuseCliError("send", reason="not-sent")
+                        reply_text = str((result.get("reply") or {}).get("text") or "")
+                        attempt["replyText"] = reply_text[:4000]
+                        self.save()
+                    else:
+                        reply_text = attempt.get("replyText", "")
+                    current = self.wait_delivery(mcp_call, batch, cancel, renewal)
+                    if current == "rejected":
+                        attempt.update({"step": step + 1, "rejectedBatchId": batch})
+                        self.save()
+                        raise RuntimeError("delivery rejected")
+                    if current != "applied":
+                        raise RuntimeError(f"delivery {current}")
+                    if renewal.lost or (cancel and cancel.is_set()):
+                        raise RuntimeError("lease or scope lost")
+                    source = "reply_text" if reply_text else "delivery_only"
+                    self.finish(item, record, mcp_call, lease_id, [batch], reply_text,
+                                source, key, temporary)
                     continue
-                lease_id = start_data.get("leaseId")
-                if not lease_id:
-                    log.warning("muse could not claim event lease: event=%s", event_id)
-                    return
-            except Exception as error:
-                log.warning("muse start_event failed: event=%s error=%s", event_id, error)
-                return
-
-            conversation_id = self.conversation_id(record)
-            try:
-                session_id = self.session_id(conversation_id)
-                prompt = self.build_prompt(record, event_pack_id, playthrough_id)
-                result = self.cli("send", prompt, "--thread", session_id, "--wait", str(MUSE_WAIT_SECONDS))
-                if result.get("sent") is not True:
-                    raise MuseCliError("send", reason="not-sent")
-                reply = result.get("reply") or {}
-                reply_text = reply.get("text")
-                if not reply_text:
-                    raise MuseCliError("send", reason="no-reply")
-
-                # Side chat submits actions directly via connector; gateway only manages lease.
-                mcp_call("xphone.finish_event", {"eventId": event_id, "leaseId": lease_id, "status": "completed"})
-                mcp_call("xphone.ack_inbox", {"cursor": cursor})
-                path.unlink(missing_ok=True)
-                self.state["events"].pop(event_id, None)
-                self.save()
-                log.info("muse event finished and acked: event=%s cursor=%s (actions via connector)",
-                         event_id, cursor)
-                return
             except Exception as error:
                 failures = attempt["failures"] + 1
-                delay = min(30 * 2 ** min(failures - 1, 5), MAX_BACKOFF_SECONDS)
-                self.state["events"][event_id] = {
-                    "failures": failures,
-                    "nextAt": now + delay,
-                    "playthroughId": playthrough_id,
-                }
+                delay = min(30 * 2 ** min(failures - 1, 5), 600)
+                attempt.update({"failures": failures, "nextAt": time.time() + delay})
                 self.save()
-                op = getattr(error, "operation", "dispatch")
-                reason = getattr(error, "reason", type(error).__name__)
-                code = getattr(error, "returncode", None)
-                log.warning("muse dispatch failed: event=%s op=%s reason=%s code=%s retry_in=%ss",
-                            event_id, op, reason, code, delay)
+                log.warning("muse dispatch deferred: event=%s reason=%s retry_in=%ss",
+                            event_id, type(error).__name__, delay)
                 return

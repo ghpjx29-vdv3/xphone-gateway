@@ -1,62 +1,16 @@
-# Side Chat Prompt 策略：两个要害
+# Muse Side Chat Prompt 与共享上下文
 
-## 要害 1：Tiered Prompt 加载（OS 全量 vs Subagent 极简）
+## 当前实现
 
-### 问题
-如果每个 subagent 每次都灌入全量 prompt（身份 + 世界观 + 人物卡 + 16 种 action），回复会很慢。OS agent 需要全上下文，但 subagent 不需要。
+- OS 读取 Worker pack 的 `osagent.md` 与其 include，叠加 Gateway 的本轮投递协议 `gateway/prompts/agent-turn.md`。输入包含当前用户/系统事件、window memory、角色目录、可见 surface 摘要、最近 ledger 与文档索引。
+- Messages、社媒和地图 subagent 各读 Worker pack 中自己的角色 prompt。输入仅包含当前 surface、目标角色、筛选后的共享摘要和本角色 action schema；其他私聊全文不进入本轮 prompt。
+- Gateway 从 `xphone.list_app_actions` 取当前 schema 并按 route 过滤，不把全部 action 手册灌给 subagent。角色需要故事正文时使用 `story.get_context(eventId, consumer)` 和 `story.read_reference(eventId, consumer, referenceId)`；Worker 核对 consumer 与事件 route，并结合客户端解锁状态裁决。
+- `muse-memory.json` 按 pack/playthrough 保存 AI 摘要和已 `applied` 的 ledger。OS 与 subagent 在各自下一轮读取允许范围内的共享记忆；Muse 旁聊自身的历史仍按角色隔离。
+- OS 用户对话使用固定旁聊；OS 后台事件使用逐事件临时旁聊，同一事件重试复用原会话。角色 side chat 按 roleId 复用。临时会话完成后删除。CLI `/clear` 的语义仍待 Muse VM 验证。
+- 旁聊直接调用已有连接器工具提交加密 App action 或角色消息；Gateway 使用固定 batchId 查询 `get_delivery`，客户端 `applied` 后才把普通回复的有界片段记入共享摘要并完成事件。旁聊无需回复 JSON。
 
-### 方案
-**os-agent（读全量 P0）**：
-- `runtime.list_assets` → `runtime.read_asset` 读自己的 OS prompt
-- `story.get_context` → `story.read_reference` 读世界观、时间线（全量）
-- `story.get_context` → `story.read_reference` 读人物卡、关系图（全量）
-- 16 种 action 类型全知道（从 `xphone.list_app_actions` 拉）
-- 慢一点可接受，它是主脑
+## 凭证边界
 
-**subagent（极简启动）**：
-- 只读自己的 role prompt（如 `messages.md`，几百字）
-- 不预读 story，不读人物卡
-- 只知道自己 role 相关的 1-2 种 action：
-  - messages subagent: `messages.append`
-  - maps subagent: `map.set_actor_position`, `map.place_item`, etc.
-  - socialmedia subagent: `socialmedia.applyBatch`
-- 事件来了直接干，prompt 短，回复快
+普通 Muse 连接器会话不能调用 Gateway 专用的原始 `runtime.*`、收件箱和事件租约工具。Gateway 从 `/account/gateway-session` 获取专用短期令牌并读取 pack prompt。Worker 不能解密 action，因此动作内容仍由 XPhone 客户端校验。
 
-**按需拉取**：
-- subagent 如果缺上下文，自己调 `story.get_context` / `story.read_reference` 现查
-- 不用 os 推送，不用网关中转
-
-### 网关实现
-`build_prompt` 拆两版：
-- os 版：完整 P0 + 16 actions
-- subagent 版：role 身份 + 1-2 actions + "缺啥自己调 story 工具查"
-
----
-
-## 要害 2：OS 与 Subagent 当前无共享上下文
-
-### 现状
-- os-agent side chat 和各 subagent side chat 是**完全隔离**的 Muse 会话
-- 各自有独立 conversation_id：
-  - os-agent: `{playthrough}:os-agent:ops`（或 payload 自带的 conversationId）
-  - subagent: `{playthrough}:{roleId}`（如 `{playthrough}:messages`）
-- 上下文不互通，网关不在中间传话
-- 网关只按 `route.role` 路由事件，不做上下文同步
-
-### 影响
-- subagent 不知道 os-agent 刚才干了什么
-- os-agent 不知道 subagent 的执行结果（除非通过事件回流）
-- 靠"各聊各的" + "按需自查" 维持，不是真共享
-
-### 未来可选
-- 网关在 dispatch 给 subagent 时，附带一个精简的上下文摘要（需要网关能读到 os 会话内容，目前做不到）
-- 或保持现状：subagent 按需调 `story.*` 工具自查，不依赖 os 推送
-
----
-
-## 验证状态（2026-11-03）
-- ✅ 连接器凭证已修复（34 工具，200 OK）
-- ✅ 旁聊可 `connector_search` 到 `custom.xphone-agent-worker`
-- ✅ 旁聊可用内容密钥（用户已批）
-- ✅ `xphone.list_app_actions` 返回 16 种 action（已同步到 prompt）
-- ⏳ 网关 prompt 拆两版（待实现）
+实施细节见 [Agent 共享上下文计划](muse-agent-context-plan.md)；实测步骤见 [Muse 与前端联调指南](muse-front-end-integration.md)。
