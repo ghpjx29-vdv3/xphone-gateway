@@ -24,7 +24,7 @@ tail -n 80 gateway.log
 2. 普通连接器的 `tools/list` 不应列出 `runtime.read_asset`、`xphone.finish_event`。Gateway 自己的短期会话仍可调用这些工具。
 3. 发一条 OS 用户消息。Gateway 日志应出现 `inbox write`、`muse session created`、`muse event completed`。Muse side chat 用本轮固定 batchId 提交加密 App action；客户端 `applied` 后，Gateway 才写入 `muse-memory.json` 并确认事件。
 4. 对同一角色连续发两条 Messages 消息，确认复用该角色旁聊；换另一个角色，确认进入另一旁聊。OS 后台事件使用临时旁聊，完成后删除。普通 OS 对话保持固定旁聊。
-5. 角色调用 `story.get_context({"eventId":"本轮事件 ID","consumer":"本轮 route.consumer"})` 后按需读取 `story.read_reference({"eventId":"本轮事件 ID","consumer":"本轮 route.consumer","referenceId":"索引中的 ID"})`；伪造 consumer 或读取不属于该 route 的 reference 应被拒绝。
+5. 角色调用 `story.get_context({"eventId":"本轮事件 ID","consumer":"本轮 route.consumer"})` 后按需读取 `story.read_reference({"eventId":"本轮事件 ID","consumer":"本轮 route.consumer","referenceId":"索引中的 ID"})`；伪造 consumer 或读取不属于该 route 的 reference 应被拒绝。当前是 event route 级授权，共享连接器凭证不区分具体旁聊身份。
 6. 在专用测试帐号连续创建 20 个临时旁聊，记录创建时延、速率限制、会话上限及侧边栏表现，完成后清理。若要改用固定 ops 会话，先在专用测试旁聊验证 CLI 发送 `/clear` 后下一条消息确实不继承旧上下文；UI 有 `/clear` 不等于 CLI 一定执行。
 
 ## 前端侧检查

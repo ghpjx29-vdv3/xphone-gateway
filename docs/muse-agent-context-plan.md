@@ -117,7 +117,7 @@ Gateway 将事件整理为语义字段：触发原因、当前 App 与 surface�
 
 ### 7.4 文档权限的实际约束
 
-参考实现由 `contextProjection.ts` 与 `contextDocumentTools.ts` 在**服务端工具层**执行可见性判定。实施后的 XPhone Worker 要求故事工具同时提供 `eventId` 与 `consumer`，核对该 consumer 是否等于正在运行事件的 route；原始 `runtime.*` 工具仅允许 Gateway 专用会话使用。当前仍需在 Muse VM 实测普通连接器无法越权读取。
+参考实现由 `contextProjection.ts` 与 `contextDocumentTools.ts` 在**服务端工具层**执行可见性判定。实施后的 XPhone Worker 要求故事工具同时提供 `eventId` 与 `consumer`，核对该 consumer 是否等于正在运行事件的 route；原始 `runtime.*` 工具仅允许 Gateway 专用会话使用。Muse 连接器当前使用共享的普通凭证，Worker 尚不能鉴别具体是哪一个旁聊，因此这属于**事件 route 级授权**，不是旁聊身份级强隔离。
 
 Gateway 从 `/account/gateway-session` 取得专用短期凭证；Muse 连接器使用普通凭证。Worker 按凭证隐藏原始配置工具，并按事件 route 和客户端解锁状态过滤故事文档。Worker 无法解密 action 内容，实际 App 动作仍由客户端校验。
 
@@ -159,4 +159,4 @@ Gateway 唤醒旁聊时只提示发现并使用 Muse 的 XPhone 连接器，同�
 - Subagent 完成后有界的 AI 回复摘要在下一次该角色回合可见；OS 可看到适合规划的摘要；其他角色只能按可见性或明确 `ccNotice` 得知。
 - Side chat 提交 batch 后，`queued` 不完成事件；客户端 `applied` 后才写入记忆并 `finish_event/ack_inbox`；`rejected` 不产生成功记忆。旁聊无需回复 JSON；同一事件重试不重复应用动作或追加 ledger。
 - 长于 90 秒的 Muse 回合及后续 delivery 等待仍能每 30 秒续租；Gateway 重启后能根据持久会话映射与 Worker 状态继续处理未完成事件。
-- 文档强隔离如作为交付要求，必须实际验证 side chat 无法调用其他角色的文档正文或原始真相资产；只检查 prompt 内容不能证明这一点。
+- 若要求旁聊身份级文档隔离，还需为每个旁聊提供独立作用域凭证；目前仅保证普通凭证不可读取原始 runtime asset，并按所提交的运行事件 route 过滤故事文档。只检查 prompt 内容不能证明身份级隔离。
