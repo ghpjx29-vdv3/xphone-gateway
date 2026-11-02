@@ -108,9 +108,9 @@ class Gateway:
             try:
                 decrypted = self.decrypt_envelope(envelope)
             except Exception as error:
-                log.error("decrypt blocked: event=%s cursor=%s error=%s",
+                log.error("decrypt blocked: event=%s cursor=%s error=%s (skipping)",
                           event_id, cursor, type(error).__name__)
-                raise
+                continue
             aad = json.loads(b64u_decode(envelope["aad"]).decode("utf-8"))
             record = {
                 "id": event_id,
