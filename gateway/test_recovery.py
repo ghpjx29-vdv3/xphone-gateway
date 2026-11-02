@@ -6,6 +6,7 @@ import os
 import tempfile
 import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import gateway as gateway_module
@@ -61,6 +62,23 @@ class RetainedInboxTests(unittest.TestCase):
         self.gateway.pull_inbox()
         self.assertTrue(os.path.exists(path))
         self.assertEqual(calls, [0, 1, 0, 1])
+
+    def test_muse_provider_dispatches_after_inbox_persist(self):
+        item = event(1)
+        self.gateway.scope = {"playthroughId": "play"}
+        self.gateway.mcp_call = lambda _name, args: {
+            "content": [{"text": json.dumps({"items": [item] if args["cursor"] == 0 else []})}]
+        }
+        dispatched = []
+
+        def dispatch(items, _mcp_call, playthrough_id):
+            self.assertTrue(os.path.exists(os.path.join(self.inbox, "event-1.json")))
+            dispatched.append((items, playthrough_id))
+
+        self.gateway.muse_dispatch = SimpleNamespace(dispatch=dispatch)
+        with patch.object(gateway_module, "PROVIDER", "muse"):
+            self.gateway.pull_inbox()
+        self.assertEqual(dispatched, [([item], "play")])
 
     def test_bad_first_envelope_does_not_skip_later_events(self):
         self.gateway.decrypt_envelope = lambda envelope: (

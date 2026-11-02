@@ -1,10 +1,10 @@
 # XPhone Gateway
 
-把 XPhone 云手机的 Agent WebSocket 接进本地可信环境，让 Muse（或其他 Agent）能收事件、解密、回动作。目标是打包成 git/npm 包，供其他用户一键连接自己的 XPhone。
+把 XPhone 云手机的 Agent WebSocket 接进个人代理所在的可信环境。Muse 用户直接在自己的 Muse VM 运行 Gateway，不需要另购 VPS；其他个人代理仍可选择现有 worker provider。
 
 ## 这是什么（给新用户）
 
-XPhone 的 Agent 侧没有公网回调——云手机只接受**出站** WebSocket 连接。本网关是一个常驻进程，主动连上 XPhone Worker 的 Agent WS，收事件通知、拉取并解密事件，写成明文 JSON 文件；再由 hook 唤醒 worker 按 `playthroughId:roleId` 路由处理，最后经 MCP 提交加密的 App 动作。
+Gateway 常驻在 Muse VM，主动连上 XPhone Worker 的 Agent WS。Worker 先持久化客户端事件，再发 WS 通知；Gateway 拉取事件后按 provider 分发。Muse provider 用 `muse-cli send --wait 0` 唤醒专用 side chat，指令只携带 `conversation_id` 和 `event_id`，Muse 通过已有 XPhone MCP 读取实际事件并写回回复。低频 Hook 保留为故障兜底。
 
 ```
 ┌─ XPhone Worker (Cloudflare) ─────────────────┐
@@ -12,14 +12,14 @@ XPhone 的 Agent 侧没有公网回调——云手机只接受**出站** WebSock
 └──────────────┬───────────────────────────────┘
                │ 出站 WSS, 子协议 xphone-agent-ticket.<ticket>
 ┌──────────────▼───────────────────────────────┐
-│  gateway.py (systemd 常驻)                    │
+│  gateway.py (Muse VM 上的 systemd 常驻服务)   │
 │   取票 → 连 WS → 收通知 → 拉取 → 解密 → 落盘    │
 └──────────────┬───────────────────────────────┘
                │  ~/xphone/inbox/<event-id>.json (明文, 处理完删除)
 ┌──────────────▼───────────────────────────────┐
-│  hook (15s 轮询) → worker                     │
-│   路由 → start_event → 执行业务 → finish_event  │
-│   → ack_inbox → 删文件                         │
+│  Muse provider → muse-cli side chat          │
+│   MCP 读事件 → 处理 → MCP 写回复 → finish_event │
+│   → ack_inbox；Hook 每 10 分钟兜底             │
 └──────────────────────────────────────────────┘
 ```
 
@@ -39,7 +39,7 @@ batch 的 delivery→applied，或检测该用户 agent WS 在线）。
    "一期只支持 Linux+systemd，你的系统是 <xx>，暂不支持"。
 1. **取代码**：`git clone <repo> ~/xphone-gateway`（目录已存在则 `git pull` 更新）；
    通读本 README。
-2. **装依赖**：`python3 -m venv .venv && .venv/bin/pip install cryptography`
+2. **装依赖**：把仓库的 `gateway/` 内容同步到 `~/xphone/gateway/`，再在目标目录执行 `python3 -m venv .venv && .venv/bin/pip install cryptography`。Muse provider 还需在 VM 安装并登录 `muse-cli`。
    （Python 3.10+；加解密必须用该 venv 的 python，系统 python 没有 cryptography）。
 3. **向用户索要两样东西**（告诉用户去 XPhone 前端「个人代理」页一键复制）：
    - 个人令牌（Bearer，用于 MCP 鉴权）
@@ -59,9 +59,9 @@ batch 的 delivery→applied，或检测该用户 agent WS 在线）。
 
    网关通过子进程调用 MCP 客户端拿 ticket、拉 inbox、提交动作——没有这一步网关连不上。
    令牌走平台的安全密钥机制（如 Secure Vault），**绝不写进仓库任何文件、绝不明文落盘**。
-6. **起常驻网关**：`sudo cp xphone-gateway.service /etc/systemd/system/ &&
+6. **起常驻网关**：先用 `sudo env HOME=/home/hatch wss_proxy="${https_proxy:-${HTTPS_PROXY:-}}" "$(command -v muse-cli)" status` 确认服务所用的 HOME 和 Muse CLI 可连接，再从 `~/xphone/gateway/` 执行 `sudo cp xphone-gateway.service /etc/systemd/system/ &&
    sudo systemctl daemon-reload && sudo systemctl enable --now xphone-gateway`
-   （已安装则为重装+重启）。如需出站代理，先按「前置条件」配好 `proxy.env`。
+   （已安装则为重装+重启）。服务模板选择 Muse provider；如需出站代理，先配好 `proxy.env`。若 systemd 找不到 CLI，在该文件写入 `XPHONE_MUSE_CLI=/绝对路径/muse-cli`。将 Hook 脚本同步到 `~/hooks/scripts/xphone-inbox.sh`，并通过 Muse 的 Hook 管理工具把已注册 Hook 的 `poll_interval_secs` 更新为 600；只复制 JSON 文件不会更新已注册配置。
 7. **装 watchdog**：按「运行与自愈」把 `watchdog.sh` 加入定时任务（每 10 分钟）。
    （云主机约每 2 小时被回收一次，watchdog 检查最近成功拉取时间并恢复；重启后重新拉取服务端未确认事件。）
 8. **验证**：`~/xphone/gateway/gateway.log` 应出现取票成功、WS 已连接、cursor 在推进；
@@ -98,7 +98,10 @@ batch 的 delivery→applied，或检测该用户 agent WS 在线）。
 ## 安装
 
 ```bash
-git clone <repo> xphone-gateway && cd xphone-gateway
+git clone <repo> ~/xphone-gateway
+mkdir -p ~/xphone/gateway
+cp -a ~/xphone-gateway/gateway/. ~/xphone/gateway/
+cd ~/xphone/gateway
 python3 -m venv .venv && .venv/bin/pip install cryptography websocket-client
 
 # 1. 放内容密钥（0600，其他人不可读）
@@ -117,12 +120,29 @@ sudo systemctl enable --now xphone-gateway.service
 
 MCP 令牌走各 Agent 平台自己的密钥机制（如 Muse 的 Secure Vault + connector），**不要**写进本仓库任何文件。
 
+### 已有 Muse VM 升级
+
+仓库更新后，把新代码和服务模板同步到原有的 `/home/hatch/xphone/gateway/`，保留该目录原有的 `proxy.env`、内容密钥和账号令牌：
+
+```bash
+cd ~/xphone-gateway && git pull
+cp gateway/gateway.py gateway/muse_dispatch.py gateway/xphone-gateway.service ~/xphone/gateway/
+cp hooks/xphone-inbox.sh ~/hooks/scripts/xphone-inbox.sh
+sudo cp ~/xphone/gateway/xphone-gateway.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl restart xphone-gateway
+```
+
+如果 `muse-cli` 不在 systemd 的 PATH，在原有 `~/xphone/gateway/proxy.env` 中添加 `XPHONE_MUSE_CLI=` 和 CLI 的绝对路径。通过 Muse 的 Hook 管理工具将已注册的 `xphone-inbox` 轮询间隔改为 600 秒；仅复制仓库中的 Hook JSON 不会修改已注册配置。发一条 XPhone 测试消息后，检查 Gateway 日志中出现 `muse wake sent`，并确认 Muse 使用 XPhone MCP 写回了回复。
+
 ## 配置项
 
 | 项 | 位置 | 说明 |
 |---|---|---|
 | 内容密钥 | `~/.config/xphone/content.key` | base64url 32 字节，0600。网关启动读一次进内存 |
-| 代理 | `gateway/proxy.env` | `https_proxy`/`http_proxy` 等，0600。直连可用时可留空 |
+| 代理 | `gateway/proxy.env` | `https_proxy`/`wss_proxy` 等，0600。Muse WSS 优先使用 `wss_proxy`，未设置时沿用 HTTPS 代理 |
+| provider | systemd 服务 / `proxy.env` | 服务模板设为 `muse`；其他个人代理可在 `proxy.env` 设 `XPHONE_PROVIDER=worker` 使用现有 worker 路径 |
+| Muse CLI | Muse VM | 登录凭证只保存在该 VM；`XPHONE_MUSE_CLI` 可指定可执行文件的绝对路径，不传给公共 Worker 或写入日志 |
 | MCP 客户端 | 外部 | 本网关经子进程调用 vetted 的 MCP 客户端拿 ticket、拉 inbox |
 | 收件箱 | `~/xphone/inbox/` | 明文事件落地，worker 处理完删除，避免长期落盘 |
 
@@ -130,9 +150,9 @@ MCP 令牌走各 Agent 平台自己的密钥机制（如 Muse 的 Secure Vault +
 
 - `systemctl status xphone-gateway` 看状态；日志 `~/xphone/gateway/gateway.log`
 - **VM 会被替换**：`/etc` 是易失的，云主机替换后 systemd unit 会消失。配套 `watchdog.sh` + 定时任务（每 10 分钟）检查进程和最近成功拉取时间；异常时从 `xphone-gateway.service` 模板重装或重启。网关每次从服务端未确认队列的起点重扫，缺失的本地文件会重新生成。
-- **处理者中断**：hook 按服务端 cursor 顺序一次唤醒一个事件；文件未完成时每 120 秒重新唤醒，待 90 秒 lease 过期后重新领取。只有 `finish_event(completed)` 与 `ack_inbox` 均成功才删除文件。重试同一事件时动作批次 ID 和 action ID 必须保持不变。
+- **Muse 事件分发**：Gateway 按服务端 cursor 串行发送；每个 XPhone 会话对应一个 Muse side chat，映射和重试时间写在 `muse-dispatch.json`。同一事件至少间隔 120 秒再次发送；CLI/VM 不可用时按 30 秒起、最长 10 分钟退避。事件完成后通过 MCP 确认并处理队列，Worker 的完成通知会立即推进下一个事件。Hook 每 10 分钟检查一次作为故障兜底。重试同一事件时动作批次 ID 和 action ID 必须保持不变。
 - **事件动作提交**：把动作数组写入 JSON 文件，调用 `submit_actions.py --pack-id <packId> --playthrough-id <playthroughId> --event-id <eventId> --step <固定步骤名> --actions-file <文件>`。同一事件重试时沿用步骤名；脚本先检查交付状态，再用稳定 ID 加密提交。
-- **worker 卡住告警**：`lease-stuck-monitor.sh` + 定时任务（每 30 分钟）。hook 会每 120 秒重新唤醒最早的未完成文件；若文件仍超过 30 分钟未完成，说明自动重试持续失败，需要查看 worker 和 MCP 错误。监控只告警，不替处理者调用 `finish_event`。
+- **worker 卡住告警**：`lease-stuck-monitor.sh` + 定时任务（每 30 分钟）。Gateway 按上面的退避规则重试，Hook 每 10 分钟兜底；若文件仍超过 30 分钟未完成，需要查看 Gateway 和 MCP 错误。监控只告警，不替处理者调用 `finish_event`。
 - 手动暂停维护：`touch ~/xphone/gateway/PAUSED`，watchdog 与卡住监控都会跳过
 
 ## 关键协议细节（实测所得）
@@ -143,7 +163,7 @@ MCP 令牌走各 Agent 平台自己的密钥机制（如 Muse 的 Secure Vault +
 4. **ticket 一次性**：`open_event_stream` 的票 60 秒有效，一次一用；断线重取。单存档同时只允许一个 Agent WS（409 冲突）。
 5. **加密**：AES-256-GCM，key=base64url 解码 32 字节，nonce 12 字节随机，AAD=base64url 解码后的 aad 字节；ciphertext 含 16 字节 tag。事件 AAD 含明文 `route`（role/roleId/windowId/consumer）。
 6. **动作提交**：明文 `{"batchId","actions"}`；AAD=`{"v":1,"packId":..,"playthroughId":..,"direction":"client","kind":"action_batch","id":<batchId>}`（**无 route**、key 顺序固定、紧凑序列化）；envelope.id=batchId；重试沿用 batchId 防重。
-7. **顺序 ack**：服务端要求按 cursor 顺序 `ack_inbox`；hook 每次只唤醒最早的本地文件，未完成则在 lease 到期后重试。
+7. **顺序 ack**：服务端要求按 cursor 顺序 `ack_inbox`；Gateway 每次只分发最早的未完成事件，Hook 兜底时也只唤醒最早的本地文件。
 8. **receipt 非工作事件**：`start_event` 会被拒，直接 `get_delivery` 核验后 ack。
 9. **accepted ≠ applied**：`submit_action_batch` 返回的 accepted 只代表服务端入队，不代表客户端落地。必须用 `xphone.get_delivery` 复核最终状态（applied / rejected / queued），rejected 的 batch 内容实际从未到达客户端。
 10. **actor 强绑定**：客户端按 `policy.threadActors[threadId] === action.from` 严格校验。`messages.append` 的 `from` 必须与目标 threadId 绑定的角色名**精确一致**（如在晚舟的 threadId 里填 `from: "顾骁"` 会被安全策略以 `Invalid Messages actor or content` 拒绝）。提交前务必核对 threadId↔角色映射。

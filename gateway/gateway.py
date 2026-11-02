@@ -8,7 +8,7 @@ Loop:
   4. On envelope notifications, pull events via MCP xphone.read_inbox.
   5. Decrypt each envelope (AES-256-GCM, content key read once at startup).
   6. Write one JSON file per event to ~/xphone/inbox/<event-id>.json.
-  7. A hook watches the inbox dir and wakes a worker per new file.
+  7. The selected provider handles the retained event; Muse uses muse-cli.
 
 Secrets: the content key is read once from ~/.config/xphone/content.key (0600)
 into memory. The account token is read by account_api from Secure Vault or a
@@ -30,6 +30,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from wsclient import WSClient, WSClientError
 from account_api import active_scope, session, mcp_call as account_mcp_call
 from key_transfer import respond_to_pending
+from muse_dispatch import MuseDispatch
 
 HOME = os.path.expanduser("~")
 BASE = os.path.join(HOME, "xphone")
@@ -38,6 +39,7 @@ HEALTH_PATH = os.path.join(BASE, "gateway", "health.json")
 SCOPE_PATH = os.path.join(BASE, "gateway", "scope.json")
 KEY_PATH = os.path.join(HOME, ".config", "xphone", "content.key")
 USER_AGENT = "XPhone-Gateway/1.0"
+PROVIDER = os.environ.get("XPHONE_PROVIDER", "worker")
 
 PING_INTERVAL = 30
 POLL_INTERVAL = 60
@@ -61,6 +63,8 @@ class Gateway:
         # Drop the base64 text; keep only key bytes in memory.
         del key_b64
         os.makedirs(INBOX, exist_ok=True)
+        self.muse_dispatch = (MuseDispatch(INBOX, os.path.join(BASE, "gateway", "muse-dispatch.json"))
+                              if PROVIDER == "muse" else None)
         self._stop = asyncio.Event()
 
     def _record_health(self) -> None:
@@ -108,9 +112,9 @@ class Gateway:
             try:
                 decrypted = self.decrypt_envelope(envelope)
             except Exception as error:
-                log.error("decrypt blocked: event=%s cursor=%s error=%s (skipping)",
+                log.error("decrypt blocked: event=%s cursor=%s error=%s",
                           event_id, cursor, type(error).__name__)
-                continue
+                raise
             aad = json.loads(b64u_decode(envelope["aad"]).decode("utf-8"))
             record = {
                 "id": event_id,
@@ -135,6 +139,8 @@ class Gateway:
             self.trigger_worker(record)
 
     def trigger_worker(self, record: dict) -> None:
+        if PROVIDER == "muse":
+            return
         decrypted = record.get("decrypted") or {}
         event_type = decrypted.get("type", "")
         if event_type in ("app.foreground", "app.background"):
@@ -172,6 +178,7 @@ class Gateway:
         # The Worker removes only acked entries. Re-scan retained entries on
         # every pull so a deleted local file can be recreated after a crash.
         cursor = 0
+        retained = []
         while True:
             res = self.mcp_call("xphone.read_inbox",
                                 {"cursor": cursor, "limit": 20})
@@ -179,12 +186,18 @@ class Gateway:
             items = json.loads(text).get("items", [])
             if not items:
                 break
+            retained.extend(items)
             self.handle_items(items)
             self._record_health()
             new_cursor = max(i.get("cursor", cursor) for i in items)
             if new_cursor <= cursor:
                 break
             cursor = new_cursor
+        if PROVIDER == "muse":
+            try:
+                self.muse_dispatch.dispatch(retained, self.mcp_call, self.scope["playthroughId"])
+            except Exception as error:
+                log.warning("muse dispatch deferred: error=%s", type(error).__name__)
         self._record_health()
 
     async def run_once(self) -> None:
@@ -261,6 +274,10 @@ class Gateway:
                 elif mtype == "envelope":
                     log.info("envelope notification cursor=%s",
                              data.get("cursor"))
+                    await asyncio.to_thread(self.pull_inbox)
+                    last_pull = time.monotonic()
+                elif mtype in ("event-finished", "inbox-acked"):
+                    log.info("queue progress notification type=%s", mtype)
                     await asyncio.to_thread(self.pull_inbox)
                     last_pull = time.monotonic()
                 else:

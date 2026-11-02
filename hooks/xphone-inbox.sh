@@ -6,7 +6,7 @@ source "$HATCH_HOOK_RUNTIME"
 
 INBOX="$HOME/xphone/inbox"
 PAUSED="$HOME/xphone/gateway/PAUSED"
-RETRY_SECONDS=120
+RETRY_SECONDS=600
 mkdir -p "$INBOX"
 [ -f "$PAUSED" ] && { silent "xphone inbox paused"; exit 0; }
 
@@ -40,7 +40,7 @@ state=$(hook_state_get)
 # State format on disk is {"seen": [...]} (plain filename list, no timestamps),
 # maintained by the hook runtime. We track wake timestamps in a separate
 # "wake_ts" dict so we don't clobber the runtime's format.
-should_skip=$(python3 - "$now" "$RETRY_SECONDS" "$file" <<'PY'
+should_skip=$(python3 - "$now" "$RETRY_SECONDS" "$file" "$state" <<'PY'
 import json
 import sys
 
@@ -48,7 +48,7 @@ now = int(sys.argv[1])
 retry = int(sys.argv[2])
 file = sys.argv[3]
 try:
-    state = json.loads(sys.stdin.read() or "{}")
+    state = json.loads(sys.argv[4] or "{}")
 except json.JSONDecodeError:
     state = {}
 
@@ -69,7 +69,7 @@ if last and now - last < retry:
 else:
     print("go")
 PY
-<<< "$state")
+)
 
 if [ "$should_skip" = "skip" ]; then
   silent "xphone inbox awaiting worker"
@@ -87,14 +87,14 @@ log "xphone inbox wake" '{"new":1}'
 wake "xphone-inbox-events" "$payload"
 
 # Record wake timestamp, preserving the runtime's existing state keys.
-new_state=$(python3 - "$now" "$file" <<'PY'
+new_state=$(python3 - "$now" "$file" "$state" <<'PY'
 import json
 import sys
 
 now = int(sys.argv[1])
 file = sys.argv[2]
 try:
-    state = json.loads(sys.stdin.read() or "{}")
+    state = json.loads(sys.argv[3] or "{}")
 except json.JSONDecodeError:
     state = {}
 if not isinstance(state, dict):
@@ -112,5 +112,5 @@ state["lastFile"] = file
 state["lastWake"] = now
 print(json.dumps(state))
 PY
-<<< "$state")
+)
 hook_state_set "$new_state"
