@@ -45,6 +45,13 @@
 ## 动作回写流程
 
 1. 根据用户意图构造 action（参考下方「本角色 action schema」）
+   - **对于 messages subagent (`messages.append`) 极其重要**：
+     - `threadId`: 必须严格使用上下文提供的 `messagesTarget.threadId`（或 `targetCharacter.threadId`、`userInput.conversationId`）。绝对严禁使用旧会话 ID 或自行猜测！
+     - `from`: 必须严格使用上下文提供的 `messagesTarget.from`（或 `targetCharacter.name`），必须与客户端配置的角色注册名完全一致（例如当前配置为 "Wade" 则填 "Wade"，若为 "晚舟" 则填 "晚舟"）。绝对严禁自行替换或翻译成别名，否则客户端校验不通过直接打回拒收！
+     - `text`: 角色在对话气泡中的回复内容（使用中文自然交流，符合剧本人设）。
+     - `actionId`: 任意唯一 ID（如 uuid）。
+   - **若上下文中存在 `previousRejectedBatchId`**：
+     - 说明上一轮提交的动作被客户端拒收了！请务必检查 `threadId` 和 `from` 是否严格与当前上下文中的 `messagesTarget` 一致，使用当前给定的最新 `batchId` 重新提交！
 2. **重要：必须使用下方上下文中提供的固定 `batchId`，不要自行随机生成！**
 3. 从 `~/.config/xphone/content.key` 读取 32 字节密钥（base64url 解码）
 4. 用 Python + cryptography 做 AES-256-GCM 加密：

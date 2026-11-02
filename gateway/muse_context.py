@@ -64,24 +64,48 @@ class MuseContext:
                      (role == "subagent" and action["role"] == f"{app} subagent") or
                      (role == "os-agent" and action["role"].startswith("os-agent"))]
         payload = event.get("payload") or {}
+        user_input_keys = ("text", "messageId", "actorId", "conversationId", "threadId", "postId", "requestKind",
+                           "platform", "action", "placeId", "item", "location", "noteId")
         current = {
             "eventId": record["id"], "batchId": batch_id, "consumer": route["consumer"],
             "type": event.get("type"), "appId": event.get("appId"),
             "surfaceId": event.get("surfaceId"), "windowId": event.get("windowId"),
-            "userInput": {key: payload[key] for key in ("text", "messageId", "actorId", "postId", "requestKind",
-                                                       "platform", "action", "placeId", "item", "location", "noteId") if key in payload},
+            "userInput": {key: payload[key] for key in user_input_keys if key in payload},
             "surfaceSummary": event.get("surfaceSummary"), "sharedMemory": memory,
             "recentLedger": event.get("recentLedger", []),
         }
+        if payload.get("recentHistory"):
+            current["recentChatHistory"] = payload["recentHistory"]
         if rejected_batch:
             current["previousRejectedBatchId"] = rejected_batch
+
+        matched_actor = None
+        for actor in event.get("actors", []):
+            if payload.get("actorId") and actor.get("actorId") == payload.get("actorId"):
+                matched_actor = actor
+                break
+            if payload.get("conversationId") and actor.get("threadId") == payload.get("conversationId"):
+                matched_actor = actor
+                break
+
         if role == "os-agent":
             current.update({"windowMemory": event.get("windowMemory"), "actors": event.get("actors", []),
                             "recentControlMessages": event.get("recentControlMessages", []),
                             "notes": event.get("notes", [])})
         elif app == "messages":
-            current["actors"] = [actor for actor in event.get("actors", [])
-                                 if actor.get("actorId") == payload.get("actorId")]
+            if matched_actor:
+                current["actors"] = [matched_actor]
+                current["targetCharacter"] = matched_actor
+                current["messagesTarget"] = {
+                    "threadId": matched_actor.get("threadId"),
+                    "from": matched_actor.get("name"),
+                }
+            else:
+                current["actors"] = event.get("actors", [])
+                if payload.get("conversationId"):
+                    current["messagesTarget"] = {
+                        "threadId": payload.get("conversationId"),
+                    }
         instructions = (Path(__file__).parent / "prompts" / "agent-turn.md").read_text(encoding="utf-8")
         return "\n\n".join([base_prompt, instructions,
                            "当前事件与共享上下文：" + json.dumps(current, ensure_ascii=False),
