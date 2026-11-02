@@ -214,6 +214,16 @@ class MuseDispatch:
                         raise RuntimeError(f"delivery {current}")
                     if renewal.lost or (cancel and cancel.is_set()):
                         raise RuntimeError("lease or scope lost")
+                    if not reply_text:
+                        try:
+                            history = self.cli("history", "--thread", session_id, "--limit", "5")
+                            items = history if isinstance(history, list) else history.get("messages", []) if isinstance(history, dict) else []
+                            for ev in reversed(items):
+                                if ev.get("text") and ("assistant" in str(ev.get("role", "")).lower()):
+                                    reply_text = str(ev["text"])
+                                    break
+                        except Exception as err:
+                            log.warning("muse history fallback failed: %s", err)
                     source = "reply_text" if reply_text else "delivery_only"
                     self.finish(item, record, mcp_call, lease_id, [batch], reply_text,
                                 source, key, temporary)
