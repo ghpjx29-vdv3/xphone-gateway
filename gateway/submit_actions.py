@@ -38,13 +38,17 @@ def mcp_call(name: str, args: dict, timeout: int = 60) -> dict:
 
 
 def submit_batch(actions: list, pack_id: str, playthrough_id: str,
-                 batch_id: str | None = None) -> str:
-    global _session
-    _session = session()
-    if _session["scope"]["packId"] != pack_id or _session["scope"]["playthroughId"] != playthrough_id:
-        raise RuntimeError("requested pack is not active")
-    key = b64u_dec(open(KEY_PATH).read().strip())
-    aesgcm = AESGCM(key)
+                 batch_id: str | None = None,
+                 mcp_call_fn=None, key_bytes: bytes | None = None) -> str:
+    call = mcp_call_fn or mcp_call
+    if mcp_call_fn is None:
+        global _session
+        _session = session()
+        if _session["scope"]["packId"] != pack_id or _session["scope"]["playthroughId"] != playthrough_id:
+            raise RuntimeError("requested pack is not active")
+    if key_bytes is None:
+        key_bytes = b64u_dec(open(KEY_PATH).read().strip())
+    aesgcm = AESGCM(key_bytes)
     batch_id = batch_id or str(uuid.uuid4())
     plaintext = json.dumps(
         {"batchId": batch_id, "actions": actions},
@@ -63,21 +67,24 @@ def submit_batch(actions: list, pack_id: str, playthrough_id: str,
         "ciphertext": b64u(ct),
         "aad": b64u(aad),
     }
-    res = mcp_call("xphone.submit_action_batch", {"envelope": envelope})
+    res = call("xphone.submit_action_batch", {"envelope": envelope})
     text = res["content"][0]["text"]
     print(f"batch {batch_id} submitted: {text[:300]}", flush=True)
     # Persist full batch id for delivery checks
-    with open(os.path.join(HOME, "xphone", "gateway", "batches.log"),
-              "a") as f:
+    log_dir = os.path.join(HOME, "xphone", "gateway")
+    os.makedirs(log_dir, exist_ok=True)
+    with open(os.path.join(log_dir, "batches.log"), "a") as f:
         f.write(f"{batch_id} {text[:120]}\n")
     return batch_id
 
 
 def submit_event_actions(event_id: str, step: str, actions: list,
-                         pack_id: str, playthrough_id: str) -> str:
+                         pack_id: str, playthrough_id: str,
+                         mcp_call_fn=None, key_bytes: bytes | None = None) -> str:
+    call = mcp_call_fn or mcp_call
     identity = f"xphone:{playthrough_id}:{event_id}:{step}"
     batch_id = str(uuid.uuid5(uuid.NAMESPACE_URL, identity))
-    result = mcp_call("xphone.get_delivery", {"batchId": batch_id})
+    result = call("xphone.get_delivery", {"batchId": batch_id})
     delivery = json.loads(result["content"][0]["text"])
     if delivery["status"] in ("queued", "applied"):
         print(f"batch {batch_id} already {delivery['status']}", flush=True)
@@ -86,7 +93,10 @@ def submit_event_actions(event_id: str, step: str, actions: list,
         raise RuntimeError(f"batch {batch_id} is {delivery['status']}")
     for index, action in enumerate(actions):
         action["actionId"] = str(uuid.uuid5(uuid.NAMESPACE_URL, f"{identity}:{index}"))
-    return submit_batch(actions, pack_id, playthrough_id, batch_id)
+    if mcp_call_fn is None and key_bytes is None:
+        return submit_batch(actions, pack_id, playthrough_id, batch_id)
+    return submit_batch(actions, pack_id, playthrough_id, batch_id,
+                        mcp_call_fn=call, key_bytes=key_bytes)
 
 
 def main() -> None:

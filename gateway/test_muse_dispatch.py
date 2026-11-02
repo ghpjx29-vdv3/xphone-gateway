@@ -1,4 +1,4 @@
-"""Muse wake ordering and retry behavior for retained Worker events."""
+"""Muse wake ordering, prompt building, reply submission, and lifecycle handling for retained Worker events."""
 
 import json
 import os
@@ -18,69 +18,145 @@ class MuseDispatchTests(unittest.TestCase):
         self.inbox = Path(self.tmp.name) / "inbox"
         self.inbox.mkdir()
         self.dispatcher = MuseDispatch(str(self.inbox), str(Path(self.tmp.name) / "state.json"))
+        # 32-byte test key
+        self.test_key = b"12345678901234567890123456789012"
 
-    def item(self, cursor, conversation):
+    def item(self, cursor, conversation, event_type="os.user_message", text="PRIVATE_MESSAGE"):
         event_id = f"event-{cursor}"
         (self.inbox / f"{event_id}.json").write_text(json.dumps({
-            "id": event_id, "playthroughId": "play",
-            "decrypted": {"payload": {"conversationId": conversation, "text": "PRIVATE_MESSAGE"}},
+            "id": event_id, "playthroughId": "play", "packId": "blank-pack",
+            "decrypted": {"type": event_type, "payload": {"conversationId": conversation, "text": text}},
             "route": {"role": "os-agent", "roleId": "os"},
         }))
         return {"cursor": cursor, "envelope": {"id": event_id, "kind": "event"}}
 
-    def test_one_event_at_a_time_and_deduplicated_wake(self):
-        items = [self.item(1, "first"), self.item(2, "second")]
+    def test_one_event_at_a_time_and_end_to_end_submit(self):
+        items = [self.item(1, "first", text="hello muse"), self.item(2, "second", text="second msg")]
         statuses = {"event-1": "accepted", "event-2": "accepted"}
         sent = []
-        acked = []
+        mcp_calls = []
 
         def mcp(name, args):
+            mcp_calls.append((name, args))
             if name == "xphone.get_event_status":
-                value = {"status": statuses[args["eventId"]]}
-            else:
-                acked.append(args["cursor"])
-                value = {"ok": True}
-            return {"content": [{"text": json.dumps(value)}]}
+                return {"content": [{"text": json.dumps({"status": statuses[args["eventId"]]})}]}
+            elif name == "xphone.start_event":
+                return {"content": [{"text": json.dumps({"status": "running", "leaseId": f"lease-{args['eventId']}"})}]}
+            elif name == "xphone.finish_event":
+                statuses[args["eventId"]] = "completed"
+                return {"content": [{"text": json.dumps({"ok": True})}]}
+            elif name == "xphone.get_delivery":
+                return {"content": [{"text": json.dumps({"status": "unknown"})}]}
+            elif name == "xphone.submit_action_batch":
+                return {"content": [{"text": json.dumps({"batchId": args["envelope"]["id"], "status": "queued"})}]}
+            elif name == "xphone.ack_inbox":
+                return {"content": [{"text": json.dumps({"ok": True})}]}
+            return {"content": [{"text": "{}"}]}
 
         def cli(*args):
             if args[0] == "session-start":
                 return {"session_id": f"session-{len(sent) + 1}"}
             sent.append(args)
-            return {"sent": True}
+            return {"sent": True, "reply": {"text": "收到你的测试消息！"}}
 
         self.dispatcher.cli = cli
         with patch("muse_dispatch.time.time", return_value=1000):
-            self.dispatcher.dispatch(items, mcp, "play")
-            self.dispatcher = MuseDispatch(str(self.inbox), str(Path(self.tmp.name) / "state.json"))
-            self.dispatcher.cli = cli
-            self.dispatcher.dispatch(items, mcp, "play")
+            self.dispatcher.dispatch(items, mcp, "play", pack_id="blank-pack", key_bytes=self.test_key)
             self.assertEqual(len(sent), 1)
-            statuses["event-1"] = "completed"
-            self.dispatcher.dispatch(items, mcp, "play")
-        self.assertEqual(acked, [1])
-        self.assertEqual(len(sent), 2)
-        self.assertIn('"event_id": "event-1"', sent[0][1])
-        self.assertIn('"event_id": "event-2"', sent[1][1])
-        self.assertNotIn("PRIVATE_MESSAGE", sent[0][1])
+            # Check prompt contains the message text
+            self.assertIn("hello muse", sent[0][1])
+            self.assertEqual(sent[0][4], "--wait")
+            self.assertEqual(sent[0][5], "60")
+            # Verify event-1 finished and removed
+            self.assertFalse((self.inbox / "event-1.json").exists())
+            self.assertTrue((self.inbox / "event-2.json").exists())
+
+            # Now dispatch again; event-2 should be processed
+            self.dispatcher.dispatch(items, mcp, "play", pack_id="blank-pack", key_bytes=self.test_key)
+            self.assertEqual(len(sent), 2)
+            self.assertIn("second msg", sent[1][1])
+            self.assertFalse((self.inbox / "event-2.json").exists())
+
+    def test_lifecycle_event_auto_finishes_and_acks_without_ai(self):
+        item = self.item(1, "sys", event_type="app.foreground", text="")
+        sent = []
+        mcp_calls = []
+
+        def mcp(name, args):
+            mcp_calls.append((name, args))
+            if name == "xphone.get_event_status":
+                return {"content": [{"text": json.dumps({"status": "accepted"})}]}
+            elif name == "xphone.start_event":
+                return {"content": [{"text": json.dumps({"status": "running", "leaseId": "lease-fg"})}]}
+            elif name == "xphone.finish_event":
+                return {"content": [{"text": json.dumps({"ok": True})}]}
+            elif name == "xphone.ack_inbox":
+                return {"content": [{"text": json.dumps({"ok": True})}]}
+            return {"content": [{"text": "{}"}]}
+
+        def cli(*args):
+            sent.append(args)
+            return {"sent": True}
+
+        self.dispatcher.cli = cli
+        self.dispatcher.dispatch([item], mcp, "play", pack_id="blank-pack", key_bytes=self.test_key)
+        # Should not call cli at all!
+        self.assertEqual(len(sent), 0)
+        # Should call start_event, finish_event, ack_inbox
+        called_names = [call[0] for call in mcp_calls]
+        self.assertIn("xphone.start_event", called_names)
+        self.assertIn("xphone.finish_event", called_names)
+        self.assertIn("xphone.ack_inbox", called_names)
         self.assertFalse((self.inbox / "event-1.json").exists())
+
+    def test_extract_actions_with_json_and_plain_text(self):
+        record = {
+            "id": "e1", "playthroughId": "p1",
+            "decrypted": {"type": "os.user_message", "payload": {"text": "hi"}},
+            "route": {"role": "os-agent"},
+        }
+        # Plain text
+        actions = self.dispatcher.extract_actions("纯文本回复", record)
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(actions[0]["type"], "agent.reply")
+        self.assertEqual(actions[0]["text"], "纯文本回复")
+
+        # JSON with actions
+        json_reply = (
+            "好的，为你创建角色！\n"
+            "```json\n"
+            "[\n"
+            '  {"type": "characters.create", "actorId": "lin_wei", "name": "林薇", "description": "青梅竹马"},\n'
+            '  {"type": "messages.append", "threadId": "lin_wei", "from": "林薇", "text": "好久不见！"}\n'
+            "]\n"
+            "```"
+        )
+        actions2 = self.dispatcher.extract_actions(json_reply, record)
+        self.assertEqual(len(actions2), 3)
+        self.assertEqual(actions2[0]["type"], "agent.reply")
+        self.assertIn("为你创建角色", actions2[0]["text"])
+        self.assertEqual(actions2[1]["type"], "characters.create")
+        self.assertEqual(actions2[2]["type"], "messages.append")
 
     def test_vm_failure_uses_backoff_without_losing_event(self):
         items = [self.item(1, "first")]
         calls = []
 
         def cli(*args):
+            if args[0] == "session-start":
+                return {"session_id": "s1"}
             calls.append(args)
             raise MuseCliError(args[0], 1)
 
         self.dispatcher.cli = cli
-        mcp = lambda _name, _args: {"content": [{"text": '{"status":"accepted"}'}]}
+        mcp = lambda name, _args: {"content": [{"text": '{"status":"accepted","leaseId":"l1"}'}]}
         with patch("muse_dispatch.time.time", return_value=1000):
-            self.dispatcher.dispatch(items, mcp, "play")
-            self.dispatcher.dispatch(items, mcp, "play")
+            self.dispatcher.dispatch(items, mcp, "play", pack_id="blank-pack", key_bytes=self.test_key)
+            self.dispatcher.dispatch(items, mcp, "play", pack_id="blank-pack", key_bytes=self.test_key)
         self.assertEqual(len(calls), 1)
         self.assertEqual(self.dispatcher.state["events"]["event-1"]["nextAt"], 1030)
         with patch("muse_dispatch.time.time", return_value=1031):
-            self.dispatcher.dispatch(items, mcp, "play")
+            self.dispatcher.dispatch(items, mcp, "play", pack_id="blank-pack", key_bytes=self.test_key)
         self.assertEqual(len(calls), 2)
         self.assertEqual(self.dispatcher.state["events"]["event-1"]["nextAt"], 1091)
 

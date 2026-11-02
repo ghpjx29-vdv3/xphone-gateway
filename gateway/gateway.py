@@ -24,6 +24,7 @@ import logging
 import os
 import signal
 import sys
+import threading
 import time
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -65,6 +66,7 @@ class Gateway:
         os.makedirs(INBOX, exist_ok=True)
         self.muse_dispatch = (MuseDispatch(INBOX, os.path.join(BASE, "gateway", "muse-dispatch.json"))
                               if PROVIDER == "muse" else None)
+        self._dispatch_lock = threading.Lock()
         self._stop = asyncio.Event()
 
     def _record_health(self) -> None:
@@ -193,9 +195,22 @@ class Gateway:
             if new_cursor <= cursor:
                 break
             cursor = new_cursor
-        if PROVIDER == "muse":
+        if PROVIDER == "muse" and getattr(self, "muse_dispatch", None) and getattr(self, "scope", None):
             try:
-                self.muse_dispatch.dispatch(retained, self.mcp_call, self.scope["playthroughId"])
+                try:
+                    self.muse_dispatch.dispatch(
+                        retained,
+                        self.mcp_call,
+                        self.scope["playthroughId"],
+                        pack_id=self.scope.get("packId"),
+                        key_bytes=getattr(self, "key", None),
+                    )
+                except TypeError:
+                    self.muse_dispatch.dispatch(
+                        retained,
+                        self.mcp_call,
+                        self.scope["playthroughId"],
+                    )
             except Exception as error:
                 log.warning("muse dispatch deferred: error=%s", type(error).__name__)
         self._record_health()
