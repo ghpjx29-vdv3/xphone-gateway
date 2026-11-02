@@ -45,9 +45,22 @@ class MuseDispatch:
         if proxy:
             env["wss_proxy"] = proxy
         operation = args[0]
+        cli_bin = env.get("XPHONE_MUSE_CLI")
+        if not cli_bin or not os.path.exists(cli_bin):
+            candidates = [
+                os.path.expanduser("~/.local/bin/muse-cli"),
+                "/home/hatch/.local/bin/muse-cli",
+            ]
+            for c in candidates:
+                if os.path.exists(c):
+                    cli_bin = c
+                    break
+        if not cli_bin:
+            cli_bin = "muse-cli"
+
         try:
             result = subprocess.run(
-                [env.get("XPHONE_MUSE_CLI", "muse-cli"), *args],
+                [cli_bin, *args],
                 capture_output=True, text=True, timeout=90, env=env,
             )
         except (OSError, subprocess.TimeoutExpired) as error:

@@ -8,6 +8,7 @@ Type=simple
 User=root
 Environment=HOME=/home/hatch
 Environment=XPHONE_PROVIDER=muse
+Environment=XPHONE_MUSE_CLI=/home/hatch/.local/bin/muse-cli
 EnvironmentFile=/home/hatch/xphone/gateway/proxy.env
 WorkingDirectory=/home/hatch/xphone/gateway
 ExecStart=/home/hatch/xphone/gateway/.venv/bin/python /home/hatch/xphone/gateway/gateway.py
