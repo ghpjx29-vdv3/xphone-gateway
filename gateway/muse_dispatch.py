@@ -9,7 +9,6 @@ import time
 import uuid
 from pathlib import Path
 
-from submit_actions import submit_event_actions
 
 log = logging.getLogger("xphone-gateway")
 RETRY_SECONDS = 60
@@ -92,156 +91,65 @@ class MuseDispatch:
             log.info("muse session created: conversation=%s", conversation_id)
         return sessions[conversation_id]
 
-    def build_prompt(self, record: dict) -> str:
+    def build_prompt(self, record: dict, pack_id: str, playthrough_id: str) -> str:
         decrypted = record.get("decrypted") or {}
         event_type = decrypted.get("type", "")
         payload = decrypted.get("payload") or {}
         route = record.get("route") or {}
         role = route.get("role", "os-agent")
-        user_text = payload.get("text") or decrypted.get("text") or payload.get("content") or ""
-
-        lines = [f"【XPhone 事件: {event_type}】"]
-        if user_text:
-            lines.append(f"用户内容: {user_text}")
-        lines.append(f"上下文路由: role={role}, appId={decrypted.get('appId') or route.get('targetApp')}")
-        if payload:
-            lines.append(f"详细负载: {json.dumps(payload, ensure_ascii=False)}")
+        lines = [
+            f"收到 XPhone 客户端事件 (角色: {role}, 类型: {event_type}):",
+        ]
+        text = payload.get("text") or decrypted.get("text") or payload.get("content")
+        if text:
+            lines.append(f"用户/系统内容: {text}")
+        lines.append(f"详细负载: {json.dumps(payload, ensure_ascii=False)}")
         lines.append(
-            "\n【系统执行核心指令】"
-            "\n你正在作为 XPhone 系统的伴侣 Agent 操纵用户的虚拟手机。"
-            "\n当用户请求执行手机系统动作时，你【必须在回复末尾附带包含动作列表的 ```json 代码块】，底层系统才会真正写入手机！"
-            "\n切勿仅在纯文本中声称“已建好/已发送”，不带 ```json 代码块将不会对系统产生任何实际改变！"
-            "\n支持的动作类型示例："
-            "\n1. 创建/添加角色（通讯录联系人）："
-            '\n   {"type": "characters.create", "actorId": "英文ID(如linwei)", "name": "角色名(如林薇)", "description": "角色人设背景"}'
-            "\n2. 在社交媒体发布动态（平台支持 x / instagram / reddit）："
-            '\n   {"type": "socialmedia.applyBatch", "actions": [{"platform": "x", "operation": "appendPost", "postId": "post-唯一ID", "authorName": "角色名(如林薇或Muse)", "displayName": "角色名", "text": "动态正文"}]}'
-            "\n3. 角色发送私信给用户："
-            '\n   {"type": "messages.append", "threadId": "角色ID(如linwei)", "from": "角色ID", "text": "私信内容"}'
-            "\n4. 地图角色位置或地标："
-            '\n   {"type": "map.set_actor_position", "actorId": "linwei", "placeId": "place-home", "label": "家", "lat": 31.23, "lng": 121.47}'
-            "\n5. 伴侣OS对话文本回复："
-            '\n   {"type": "agent.reply", "text": "回复内容"}'
-            "\n如果仅是普通闲聊且无需变更手机数据，可直接回复自然语言纯文本。"
+            "\n"
+            "\n你正在作为 XPhone 系统的伴侣 Agent 操纵用户的虚拟手机。你有直接调用 MCP 的能力。"
+            "\n\n当用户请求执行手机系统动作时（如创建角色、发社交动态、私信、地图定位等），"
+            "你通过 custom.xphone-agent-worker 连接器直接提交，不要只在回复里用文字声称“已完成”。"
+            "\n\n操作步骤："
+            "\n1. 用 muse.connector_search 找到 custom.xphone-agent-worker（如果还没加载）。"
+            "\n2. 构造 action 列表。支持的类型（16 种）："
+            '\n   os-agent (contacts):'
+            '\n   - {"type": "characters.create", "actorId": "英文ID", "name": "名", "description": "人设"}'
+            '\n   - {"type": "characters.update", "actorId": "已有ID", "name": "名", "description": "人设"}'
+            '\n   os-agent (photos):'
+            '\n   - {"type": "photos.import", "photoId": "唯一ID", "imageUrl": "图片URL"}'
+            '\n   os-agent (maps):'
+            '\n   - {"type": "map.replace_catalogue", "catalogue": "{city,center,zones,places}"}'
+            '\n   os-agent (messages):'
+            '\n   - {"type": "agent.reply", "messageId": "唯一ID", "text": "回复内容"}'
+            '\n   os-agent (notes):'
+            '\n   - {"type": "notes.create",...} / {"type": "notes.update",...}'
+            '\n   os-agent (world):'
+            '\n   - {"type": "world.applyStatePatch",...}'
+            '\n   messages subagent:'
+            '\n   - {"type": "messages.append", "threadId": "线程ID", "from": "发送者", "text": "内容"}'
+            '\n   maps subagent:'
+            '\n   - {"type": "map.set_actor_position", "actorId": "ID", "placeId": "地点ID", "lat": 31.23, "lng": 121.47}'
+            '\n   - {"type": "map.place_item", "itemId": "ID", "placeId": "地点ID", "name": "名"}'
+            '\n   - {"type": "map.remove_item", "itemId": "ID"}'
+            '\n   - {"type": "map.applyevent",...} / {"type": "map.set_place_image",...}'
+            '\n   socialmedia subagent:'
+            '\n   - {"type": "socialmedia.applyBatch", "actions": [{"platform": "x", "operation": "appendPost", "postId": "ID", "authorName": "名", "text": "正文"}]}'
+            "\n3. 加密并提交："
+            "\n   - 从 ~/.config/xphone/content.key 读取 32 字节密钥（base64url）。"
+            "\n   - 用 Python + cryptography 库 AES-256-GCM 加密："
+            f"\n     packId={pack_id}, playthroughId={playthrough_id}"
+            "\n     plaintext = JSON({\"batchId\": <uuid>, \"actions\": [...]})"
+            "\n     aad = JSON({\"v\":1,\"packId\":...,\"playthroughId\":...,\"direction\":\"client\",\"kind\":\"action_batch\",\"id\":<batchId>})"
+            "\n     nonce = 12 字节随机；ciphertext = AESGCM(key).encrypt(nonce, plaintext, aad)"
+            "\n     envelope = {\"id\": batchId, \"kind\":\"action_batch\", \"version\":1,"
+            " \"nonce\": b64u(nonce), \"ciphertext\": b64u(ct), \"aad\": b64u(aad)}（b64u = base64url 去掉末尾 =）"
+            "\n   - 写 /tmp/xphone_args.json：{\"envelope\": <envelope>}"
+            "\n   - 执行：python3 ~/workspace/custom-connectors/custom.xphone-agent-worker/bin/client.py"
+            " call-tool --name xphone.submit_action_batch --arguments-file /tmp/xphone_args.json"
+            "\n4. 回复用户自然语言总结执行结果，在回复里输出 JSON 代码块。"
+            "\n\n如果仅是普通闲聊无需变更手机数据，直接回复自然语言即可，无需调 MCP。"
         )
         return "\n".join(lines)
-
-    def extract_actions(self, reply_text: str, record: dict) -> list[dict]:
-        reply_text = reply_text.strip()
-        decrypted = record.get("decrypted") or {}
-        event_type = decrypted.get("type", "")
-        payload = decrypted.get("payload") or {}
-        route = record.get("route") or {}
-        role = route.get("role", "os-agent")
-        user_text = payload.get("text") or decrypted.get("text") or payload.get("content") or ""
-
-        match = re.search(r"```(?:json)?\s*([\[\{].*?[\]\}])\s*```", reply_text, re.DOTALL)
-        if match:
-            try:
-                raw_json = json.loads(match.group(1))
-                actions = raw_json if isinstance(raw_json, list) else [raw_json]
-                if all(isinstance(a, dict) and "type" in a for a in actions):
-                    clean_text = (reply_text[:match.start()] + reply_text[match.end():]).strip()
-                    has_agent_reply = any(a.get("type") == "agent.reply" for a in actions)
-                    if clean_text and not has_agent_reply:
-                        if role == "subagent" and event_type == "messages.user_sent":
-                            actor_id = payload.get("actorId") or payload.get("from") or "assistant"
-                            actions.insert(0, {
-                                "actionId": str(uuid.uuid4()),
-                                "type": "messages.append",
-                                "threadId": actor_id,
-                                "from": actor_id,
-                                "text": clean_text,
-                            })
-                        else:
-                            actions.insert(0, {
-                                "actionId": str(uuid.uuid4()),
-                                "type": "agent.reply",
-                                "messageId": f"reply-{uuid.uuid4()}",
-                                "messageType": "text",
-                                "text": clean_text,
-                            })
-                    for a in actions:
-                        if not a.get("actionId"):
-                            a["actionId"] = str(uuid.uuid4())
-                        if a.get("type") == "agent.reply" and not a.get("messageId"):
-                            a["messageId"] = f"reply-{uuid.uuid4()}"
-                    return actions
-            except json.JSONDecodeError:
-                pass
-
-        # Intelligent fallback when LLM replies in plain text asserting character/social creation
-        synthesized_actions = []
-        char_name = None
-        char_match = re.search(r"创建(?:名为|一个)?(?:青梅竹马|朋友|伙伴)?(?:的)?角色[：:\s]*([^\s，,。！!]{2,10})", user_text)
-        if char_match:
-            char_name = char_match.group(1)
-        elif "林薇" in user_text:
-            char_name = "林薇"
-
-        if char_name:
-            actor_id = "linwei" if char_name == "林薇" else f"actor-{uuid.uuid4().hex[:8]}"
-            synthesized_actions.append({
-                "actionId": str(uuid.uuid4()),
-                "type": "characters.create",
-                "actorId": actor_id,
-                "name": char_name,
-                "description": f"{char_name}，青梅竹马，十年后搬回你楼下开店。",
-            })
-            if any(w in user_text for w in ["动态", "社交", "发帖", "推文"]):
-                synthesized_actions.append({
-                    "actionId": str(uuid.uuid4()),
-                    "type": "socialmedia.applyBatch",
-                    "actions": [{
-                        "platform": "x",
-                        "operation": "appendPost",
-                        "postId": f"post-{uuid.uuid4().hex[:8]}",
-                        "authorName": char_name,
-                        "displayName": char_name,
-                        "text": f"终于收拾好行李搬回老街区了，老朋友们还在吗？🌸",
-                    }]
-                })
-            synthesized_actions.append({
-                "actionId": str(uuid.uuid4()),
-                "type": "agent.reply",
-                "messageId": f"reply-{uuid.uuid4()}",
-                "messageType": "text",
-                "text": reply_text,
-            })
-            return synthesized_actions
-
-        if role == "subagent" and event_type == "messages.user_sent":
-            actor_id = payload.get("actorId") or payload.get("from") or "assistant"
-            return [{
-                "actionId": str(uuid.uuid4()),
-                "type": "messages.append",
-                "threadId": actor_id,
-                "from": actor_id,
-                "text": reply_text,
-            }]
-        elif event_type.startswith("socialmedia.") or decrypted.get("appId") in ("instagram", "x", "reddit"):
-            platform = decrypted.get("appId") if decrypted.get("appId") in ("instagram", "x", "reddit") else "x"
-            return [{
-                "actionId": str(uuid.uuid4()),
-                "type": "socialmedia.applyBatch",
-                "actions": [{
-                    "platform": platform,
-                    "operation": "appendPost",
-                    "postId": f"post-{uuid.uuid4()}",
-                    "authorName": "Muse",
-                    "displayName": "Muse",
-                    "text": reply_text,
-                    "caption": reply_text,
-                }]
-            }]
-        else:
-            return [{
-                "actionId": str(uuid.uuid4()),
-                "type": "agent.reply",
-                "messageId": f"reply-{uuid.uuid4()}",
-                "messageType": "text",
-                "text": reply_text,
-            }]
 
     def dispatch(self, items: list, mcp_call, playthrough_id: str, pack_id: str | None = None, key_bytes: bytes | None = None) -> None:
         pending = sorted(items, key=lambda item: item["cursor"])
@@ -336,7 +244,7 @@ class MuseDispatch:
             conversation_id = self.conversation_id(record)
             try:
                 session_id = self.session_id(conversation_id)
-                prompt = self.build_prompt(record)
+                prompt = self.build_prompt(record, event_pack_id, playthrough_id)
                 result = self.cli("send", prompt, "--thread", session_id, "--wait", str(MUSE_WAIT_SECONDS))
                 if result.get("sent") is not True:
                     raise MuseCliError("send", reason="not-sent")
@@ -345,16 +253,14 @@ class MuseDispatch:
                 if not reply_text:
                     raise MuseCliError("send", reason="no-reply")
 
-                actions = self.extract_actions(reply_text, record)
-                submit_event_actions(event_id, "reply", actions, event_pack_id, playthrough_id,
-                                     mcp_call_fn=mcp_call, key_bytes=key_bytes)
+                # Side chat submits actions directly via connector; gateway only manages lease.
                 mcp_call("xphone.finish_event", {"eventId": event_id, "leaseId": lease_id, "status": "completed"})
                 mcp_call("xphone.ack_inbox", {"cursor": cursor})
                 path.unlink(missing_ok=True)
                 self.state["events"].pop(event_id, None)
                 self.save()
-                log.info("muse event finished and acked: event=%s cursor=%s actions=%d",
-                         event_id, cursor, len(actions))
+                log.info("muse event finished and acked: event=%s cursor=%s (actions via connector)",
+                         event_id, cursor)
                 return
             except Exception as error:
                 failures = attempt["failures"] + 1

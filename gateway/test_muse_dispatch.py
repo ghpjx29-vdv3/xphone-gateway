@@ -31,6 +31,8 @@ class MuseDispatchTests(unittest.TestCase):
         return {"cursor": cursor, "envelope": {"id": event_id, "kind": "event"}}
 
     def test_one_event_at_a_time_and_end_to_end_submit(self):
+        # New architecture: side chat submits via connector directly;
+        # gateway only manages lease (start/finish/ack), no submit_action_batch.
         items = [self.item(1, "first", text="hello muse"), self.item(2, "second", text="second msg")]
         statuses = {"event-1": "accepted", "event-2": "accepted"}
         sent = []
@@ -45,10 +47,6 @@ class MuseDispatchTests(unittest.TestCase):
             elif name == "xphone.finish_event":
                 statuses[args["eventId"]] = "completed"
                 return {"content": [{"text": json.dumps({"ok": True})}]}
-            elif name == "xphone.get_delivery":
-                return {"content": [{"text": json.dumps({"status": "unknown"})}]}
-            elif name == "xphone.submit_action_batch":
-                return {"content": [{"text": json.dumps({"batchId": args["envelope"]["id"], "status": "queued"})}]}
             elif name == "xphone.ack_inbox":
                 return {"content": [{"text": json.dumps({"ok": True})}]}
             return {"content": [{"text": "{}"}]}
@@ -70,6 +68,9 @@ class MuseDispatchTests(unittest.TestCase):
             # Verify event-1 finished and removed
             self.assertFalse((self.inbox / "event-1.json").exists())
             self.assertTrue((self.inbox / "event-2.json").exists())
+            # Gateway must NOT submit via MCP; side chat does it via connector
+            called_names = [c[0] for c in mcp_calls]
+            self.assertNotIn("xphone.submit_action_batch", called_names)
 
             # Now dispatch again; event-2 should be processed
             self.dispatcher.dispatch(items, mcp, "play", pack_id="blank-pack", key_bytes=self.test_key)
@@ -108,49 +109,6 @@ class MuseDispatchTests(unittest.TestCase):
         self.assertIn("xphone.finish_event", called_names)
         self.assertIn("xphone.ack_inbox", called_names)
         self.assertFalse((self.inbox / "event-1.json").exists())
-
-    def test_extract_actions_with_json_and_plain_text(self):
-        record = {
-            "id": "e1", "playthroughId": "p1",
-            "decrypted": {"type": "os.user_message", "payload": {"text": "hi"}},
-            "route": {"role": "os-agent"},
-        }
-        # Plain text
-        actions = self.dispatcher.extract_actions("纯文本回复", record)
-        self.assertEqual(len(actions), 1)
-        self.assertEqual(actions[0]["type"], "agent.reply")
-        self.assertEqual(actions[0]["text"], "纯文本回复")
-
-        # JSON with actions
-        json_reply = (
-            "好的，为你创建角色！\n"
-            "```json\n"
-            "[\n"
-            '  {"type": "characters.create", "actorId": "lin_wei", "name": "林薇", "description": "青梅竹马"},\n'
-            '  {"type": "messages.append", "threadId": "lin_wei", "from": "林薇", "text": "好久不见！"}\n'
-            "]\n"
-            "```"
-        )
-        actions2 = self.dispatcher.extract_actions(json_reply, record)
-        self.assertEqual(len(actions2), 3)
-        self.assertEqual(actions2[0]["type"], "agent.reply")
-        self.assertIn("为你创建角色", actions2[0]["text"])
-        self.assertEqual(actions2[1]["type"], "characters.create")
-        self.assertEqual(actions2[2]["type"], "messages.append")
-
-        # Intelligent fallback when plain text reply to character & social prompt
-        char_record = {
-            "decrypted": {"type": "os.user_message", "payload": {"text": "请为我在这台空白手机里创建一个青梅竹马的角色林薇，并在社交媒体发一条动态！"}},
-            "route": {"role": "os-agent"},
-        }
-        plain_char_reply = "这个我已经办好啦～林薇的角色卡已经建好，她的第一条动态也发出去了！"
-        actions3 = self.dispatcher.extract_actions(plain_char_reply, char_record)
-        types3 = [a["type"] for a in actions3]
-        self.assertIn("characters.create", types3)
-        self.assertIn("socialmedia.applyBatch", types3)
-        self.assertIn("agent.reply", types3)
-        char_act = next(a for a in actions3 if a["type"] == "characters.create")
-        self.assertEqual(char_act["name"], "林薇")
 
     def test_vm_failure_uses_backoff_without_losing_event(self):
         items = [self.item(1, "first")]
