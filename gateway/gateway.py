@@ -29,6 +29,7 @@ import time
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from wsclient import WSClient, WSClientError
 from account_api import active_scope, session, mcp_call as account_mcp_call
+from key_transfer import respond_to_pending
 
 HOME = os.path.expanduser("~")
 BASE = os.path.join(HOME, "xphone")
@@ -233,23 +234,44 @@ class Gateway:
             await ws.close()
 
     async def run(self) -> None:
-        backoff_idx = 0
-        while not self._stop.is_set():
-            try:
-                await self.run_once()
-                backoff_idx = 0
-            except Exception as e:
-                if self._stop.is_set():
-                    break
-                wait = RECONNECT_BACKOFF[min(backoff_idx,
-                                             len(RECONNECT_BACKOFF) - 1)]
-                log.warning("connection failed (%s); retry in %ss",
-                            type(e).__name__, wait)
-                backoff_idx += 1
+        async def serve_key_transfers() -> None:
+            while not self._stop.is_set():
                 try:
-                    await asyncio.wait_for(self._stop.wait(), timeout=wait)
+                    count = await asyncio.to_thread(respond_to_pending, self.key)
+                    if count:
+                        log.info("sent %d encrypted account key transfer(s)", count)
+                except Exception as error:
+                    log.warning("account key transfer poll failed: %s", type(error).__name__)
+                try:
+                    await asyncio.wait_for(self._stop.wait(), timeout=5)
                 except asyncio.TimeoutError:
                     pass
+
+        transfer_task = asyncio.create_task(serve_key_transfers())
+        backoff_idx = 0
+        try:
+            while not self._stop.is_set():
+                try:
+                    await self.run_once()
+                    backoff_idx = 0
+                except Exception as e:
+                    if self._stop.is_set():
+                        break
+                    wait = RECONNECT_BACKOFF[min(backoff_idx,
+                                                 len(RECONNECT_BACKOFF) - 1)]
+                    log.warning("connection failed (%s); retry in %ss",
+                                type(e).__name__, wait)
+                    backoff_idx += 1
+                    try:
+                        await asyncio.wait_for(self._stop.wait(), timeout=wait)
+                    except asyncio.TimeoutError:
+                        pass
+        finally:
+            transfer_task.cancel()
+            try:
+                await transfer_task
+            except asyncio.CancelledError:
+                pass
         log.info("gateway stopped")
 
     def stop(self) -> None:
