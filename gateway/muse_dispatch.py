@@ -191,6 +191,7 @@ class MuseDispatch:
                         attempt.update({"step": step + 1, "rejectedBatchId": batch})
                         self.save()
                         raise RuntimeError("delivery rejected")
+                    session_id = None
                     if current == "unknown":
                         session_id = self.session_id(key)
                         prompt = self.context.prompt(record, record["packId"], playthrough_id, batch,
@@ -216,12 +217,14 @@ class MuseDispatch:
                         raise RuntimeError("lease or scope lost")
                     if not reply_text:
                         try:
-                            history = self.cli("history", "--thread", session_id, "--limit", "5")
-                            items = history if isinstance(history, list) else history.get("messages", []) if isinstance(history, dict) else []
-                            for ev in reversed(items):
-                                if ev.get("text") and ("assistant" in str(ev.get("role", "")).lower()):
-                                    reply_text = str(ev["text"])
-                                    break
+                            sid = session_id or self.state["sessions"].get(key)
+                            if sid:
+                                history = self.cli("history", "--thread", sid, "--limit", "5")
+                                items = history if isinstance(history, list) else history.get("messages", []) if isinstance(history, dict) else []
+                                for ev in reversed(items):
+                                    if ev.get("text") and ("assistant" in str(ev.get("role", "")).lower()):
+                                        reply_text = str(ev["text"])
+                                        break
                         except Exception as err:
                             log.warning("muse history fallback failed: %s", err)
                     source = "reply_text" if reply_text else "delivery_only"

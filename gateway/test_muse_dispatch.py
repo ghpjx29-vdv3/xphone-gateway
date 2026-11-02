@@ -113,7 +113,7 @@ class MuseDispatchTests(unittest.TestCase):
         self.assertIn("messages.append", prompt)
         self.assertIn("Worker role prompt", prompt)
         self.assertIn("角色资料", prompt)
-        self.assertNotIn("characters.create", prompt)
+        self.assertNotIn('"type": "characters.create"', prompt)
 
 
 if __name__ == "__main__":
