@@ -51,6 +51,8 @@ class MuseContext:
         references = tool_data(mcp_call, "story.get_context", {"eventId": record["id"],
                                                                    "consumer": route["consumer"]}).get("references", [])
         base_prompt = self.expand(pack_id, self.asset(pack_id, PROMPTS[app], mcp_call), mcp_call)
+        base_prompt = re.sub(r"After the tool call, reply exactly:\s*\{\}", "", base_prompt)
+        base_prompt = base_prompt.replace("submit_app_actions", "xphone.submit_action_batch")
         base_prompt = base_prompt.replace("{{runtimePolicyInstructions}}",
                                           json.dumps(event.get("runtimePolicy") or {}, ensure_ascii=False))
         base_prompt = base_prompt.replace("{{knownInformation}}", "\n".join(

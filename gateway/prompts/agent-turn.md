@@ -1,5 +1,10 @@
 这是 XPhone 客户端到达的实时事件。请用 Muse 的 `connector_search` 找到 `custom.xphone-agent-worker` 连接器，并按该连接器提供的工具与已有角色 prompt 处理本轮事件。动作回写直接调用连接器。
 
+## 核心执行规则（强制）
+1. **严禁直接返回 `{}` 或空文本！** 无论你是 os-agent 还是 subagent，都必须根据本轮事件调用连接器工具 `xphone.submit_action_batch` 提交实际动作（如 `messages.append` 或 `agent.reply` 等）。
+2. 旧 prompt 中提及的 `submit_app_actions` 即为连接器的 `xphone.submit_action_batch`，必须按照下方「动作回写流程」将 actions 加密打包后提交。
+3. 提交完成后，用自然语言简述你的处理结果，严禁输出裸 `{}`。
+
 ## P0 必读（每轮开始先做）
 
 ### 1. 确认自己的身份 prompt
