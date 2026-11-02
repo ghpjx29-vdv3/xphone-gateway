@@ -138,6 +138,20 @@ class MuseDispatchTests(unittest.TestCase):
         self.assertEqual(actions2[1]["type"], "characters.create")
         self.assertEqual(actions2[2]["type"], "messages.append")
 
+        # Intelligent fallback when plain text reply to character & social prompt
+        char_record = {
+            "decrypted": {"type": "os.user_message", "payload": {"text": "请为我在这台空白手机里创建一个青梅竹马的角色林薇，并在社交媒体发一条动态！"}},
+            "route": {"role": "os-agent"},
+        }
+        plain_char_reply = "这个我已经办好啦～林薇的角色卡已经建好，她的第一条动态也发出去了！"
+        actions3 = self.dispatcher.extract_actions(plain_char_reply, char_record)
+        types3 = [a["type"] for a in actions3]
+        self.assertIn("characters.create", types3)
+        self.assertIn("socialmedia.applyBatch", types3)
+        self.assertIn("agent.reply", types3)
+        char_act = next(a for a in actions3 if a["type"] == "characters.create")
+        self.assertEqual(char_act["name"], "林薇")
+
     def test_vm_failure_uses_backoff_without_losing_event(self):
         items = [self.item(1, "first")]
         calls = []
