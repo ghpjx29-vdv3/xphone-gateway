@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from muse_delivery import batch_id, delivery_status
+from submit_actions import seal
 
 
 log = logging.getLogger("xphone-gateway")
@@ -42,17 +43,16 @@ class Delegation:
         return self.content_root / pack_id / playthrough_id / "tasks" / "delegations"
 
     @staticmethod
-    def parse(content: str) -> tuple[str, str, str, str]:
+    def parse(content: str) -> tuple[str, str, str]:
         lines = content.splitlines()
-        if len(lines) < 3 or not lines[0].startswith("父事件: ") or not lines[1].startswith("目标: ") or not lines[2].startswith("任务: "):
-            raise ValueError("任务文件须以“父事件:”“目标:”“任务:”三行开始")
-        parent = lines[0][5:].strip()
-        target = lines[1][4:].strip()
-        task = "\n".join([lines[2][4:].strip(), *lines[3:]]).strip()
+        if len(lines) < 2 or not lines[0].startswith("目标: ") or not lines[1].startswith("任务: "):
+            raise ValueError("任务文件须以“目标:”“任务:”两行开始")
+        target = lines[0][4:].strip()
+        task = "\n".join([lines[1][4:].strip(), *lines[2:]]).strip()
         app, separator, page = target.partition(" / ")
-        if not parent or not separator or not app or not page or not task:
-            raise ValueError("任务文件须填写父事件和任务；“目标:”请从本轮 localContent.delegationTargets 逐字复制完整值，修改后重新调用 xphone.delegate_task")
-        return parent, app, page, task
+        if not separator or not app or not page or not task:
+            raise ValueError("任务文件须填写目标和任务；“目标:”请从本轮 localContent.delegationTargets 逐字复制完整值，修改后重新调用 xphone.delegate_task")
+        return app, page, task
 
     @staticmethod
     def route(parent: dict, app: str, page: str) -> dict:
@@ -99,9 +99,8 @@ class Delegation:
                 raise RuntimeError("任务已被客户端拒收，请新建任务文件")
         if not path.exists():
             raise FileNotFoundError(f"找不到任务文件：{task_path}")
-        parent_id, app, page, _ = self.parse(path.read_text(encoding="utf-8"))
-        if parent_id != path.parent.name:
-            raise ValueError("任务路径中的父事件与文档不一致")
+        parent_id = path.parent.name
+        app, page, _ = self.parse(path.read_text(encoding="utf-8"))
         parent_path = self.dispatcher.inbox / f"{parent_id}.json"
         if not parent_path.exists():
             raise ValueError("父事件不在运行中")
@@ -109,6 +108,10 @@ class Delegation:
         if parent["packId"] != pack_id or parent["playthroughId"] != playthrough_id or parent["route"]["role"] != "os-agent":
             raise ValueError("父事件账号范围或角色不匹配")
         route = self.route(parent, app, page)
+        for previous in self.dispatcher.state["delegations"].values():
+            if (previous["eventId"] == parent_id and previous["route"]["surfaceId"] == route["surfaceId"]
+                    and (previous["status"] == "rejected" or previous.get("deliveryStatus") == "rejected")):
+                previous["superseded"] = True
         attempt = self.dispatcher.state["events"].setdefault(parent_id, {"failures": 0, "nextAt": 0})
         if existing:
             step = existing["step"]
@@ -144,6 +147,61 @@ class Delegation:
         self.log_state(root, task_path, "sent", parent_id, step)
         return {"status": "delegated", "taskPath": task_path,
                 "targetApp": app, "batchId": batch}
+
+    def prepare_actions(self, task_path: str, pack_id: str, playthrough_id: str,
+                        key_bytes: bytes) -> dict:
+        path = Path(task_path).resolve()
+        root = self.content_root / pack_id / playthrough_id / "tasks"
+        delegated = path.parent.parent == (root / "delegations").resolve() and TASK_NAME.fullmatch(path.name)
+        event = path.parent.parent == (root / "events").resolve() and path.name == f"{path.parent.name}.md"
+        if not delegated and not event:
+            raise ValueError("taskPath 必须指向当前游玩的任务文档")
+        if delegated:
+            record = self.dispatcher.state["delegations"].get(str(path))
+            if not record or record["status"] != "sent":
+                raise ValueError("没有运行中的派工；请核对原任务文档路径")
+            batch = record["batchId"]
+            event_id, step, route = record["eventId"], record["step"], record["route"]
+            origin = "delegation"
+        else:
+            event_id = path.parent.name
+            attempt = self.dispatcher.state["events"].get(event_id)
+            parent_path = self.dispatcher.inbox / f"{event_id}.json"
+            if not attempt or not parent_path.exists():
+                raise ValueError("没有运行中的事件")
+            parent = json.loads(parent_path.read_text(encoding="utf-8"))
+            if parent["packId"] != pack_id or parent["playthroughId"] != playthrough_id:
+                raise ValueError("事件不属于当前游玩")
+            batch = attempt["batchId"]
+            step, route = attempt["step"], parent["route"]
+            origin = "event"
+        action_path = path.with_suffix(".actions.json")
+        if not action_path.exists():
+            raise FileNotFoundError(f"找不到动作文件：{action_path}；请先写入纯语义动作数组")
+        actions = json.loads(action_path.read_text(encoding="utf-8"))
+        if not isinstance(actions, list) or not actions:
+            raise ValueError("动作文件必须是非空 JSON 动作数组；不要填写 batchId 等路由字段")
+        header = {"batchId": batch, "parentEventId": event_id, "step": step,
+                  "targetApp": route.get("targetApp") or ("journal" if event and parent["decrypted"].get("type") == "journal.main_record.requested" else "agent"),
+                  "surfaceId": route.get("surfaceId") or ("journal.main_record" if event and parent["decrypted"].get("type") == "journal.main_record.requested" else "agent.reply"),
+                  "origin": origin}
+        payload = {"actions": actions}
+        frame = None
+        if event and len(actions) == 1 and actions[0].get("type") == "journal.appendMainRecord":
+            source = parent["decrypted"]
+            details = source.get("payload") or {}
+            tick_id = source["tickId"]
+            stream_id = details["streamId"]
+            record_id = details["recordId"]
+            actions[0]["recordId"] = record_id
+            payload["tickId"] = tick_id
+            metadata = {"tickId": tick_id, "streamId": stream_id, "seq": 0, "phase": "start"}
+            frame = seal(key_bytes, pack_id, playthrough_id, "journal_frame", f"{batch}.frame",
+                         {**metadata, "recordId": record_id, "offset": 0, "text": actions[0]["markdown"]},
+                         metadata=metadata)
+        envelope = seal(key_bytes, pack_id, playthrough_id, "action_batch", batch,
+                        payload, header=header)
+        return {"envelope": envelope, "frame": frame}
 
     def poll(self, mcp_call, pack_id: str, playthrough_id: str) -> None:
         for record in list(self.dispatcher.state["delegations"].values()):

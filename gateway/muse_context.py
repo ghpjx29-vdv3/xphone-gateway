@@ -49,6 +49,8 @@ class MuseContext:
         }
         if route["role"] == "os-agent":
             paths["delegationTargets"] = target_options(record)
+            event_id = record["id"]
+            paths["eventTaskPath"] = str(root / playthrough_id / "tasks" / "events" / event_id / f"{event_id}.md")
         return paths
 
     def timed_note(self, record: dict, name: str) -> str:
@@ -71,7 +73,7 @@ class MuseContext:
         user_input = {key: payload[key] for key in ("prompt", "text", "requestKind", "platform", "action", "item", "location")
                       if key in payload}
         current = {
-            "packId": pack_id, "batchId": batch_id,
+            "packId": pack_id,
             "role": route["role"], "type": event.get("type"),
             "surface": SURFACE_NAMES.get(event.get("appId"), event.get("appId")),
             "userInput": user_input, "surfaceSummary": event.get("surfaceSummary"),
@@ -86,8 +88,6 @@ class MuseContext:
             current["recentControlMessages"] = [
                 {key: value for key, value in item.items() if key not in {"id", "timestamp"}}
                 for item in event["recentControlMessages"]]
-        if rejected_batch:
-            current["previousRejectedBatchId"] = rejected_batch
         if rejected_reason:
             current["previousRejectedReason"] = rejected_reason
         if route.get("targetApp") == "messages":
@@ -97,6 +97,9 @@ class MuseContext:
             if target:
                 current["targetCharacter"] = target["name"]
         if route["role"] == "os-agent":
+            event_task = Path(current["localContent"]["eventTaskPath"])
+            event_task.parent.mkdir(parents=True, exist_ok=True)
+            event_task.write_text("任务: 按当前事件生成个人代理回复或日记正文动作。\n", encoding="utf-8")
             current["windowMemory"] = event.get("windowMemory")
             current["actors"] = [actor["name"] for actor in event.get("actors", [])]
             current["notes"] = [note["title"] for note in event.get("notes", [])]
@@ -107,9 +110,10 @@ class MuseContext:
         if first_turn:
             parts.append((PROMPT_DIR / "agent-turn.md").read_text(encoding="utf-8").strip())
         if event.get("type") == "journal.main_record.requested":
-            parts.append("【故事续写直接写作阶段 (Phase 1)】\n请调用 `xphone.submit_journal_stream_frame` 流式输出草稿，并在最后调用 `xphone.submit_action_batch` 独占提交 `journal.appendMainRecord`（batchId 必须为此轮上下文中的 batchId）。此阶段请勿提交其他角色私聊或动作；正文落盘后将进入 Phase 2 角色联动编排。")
+            parts.append("【故事续写直接写作阶段 (Phase 1)】\n在 localContent.eventTaskPath 同名的 .actions.json 文件中写入只含一个 journal.appendMainRecord 的动作数组，字段为 type 与 markdown。调用 xphone.submit_task_actions，只填 eventTaskPath。网关自动发送单帧草稿并提交正文；正文落盘后进入 Phase 2。")
         if route["role"] == "os-agent":
             parts.append(f"需要其他 App 执行具体操作时，在云电脑目录 {current['localContent']['taskDirectory']} 写一份 <uuid4>.md 任务文档。“目标:”只能从 localContent.delegationTargets 复制完整值；调用 xphone.delegate_task 时只填文档绝对路径。若工具报目标不在列表，按返回的可用目标修正文档后重试。成功回执只表示 subagent 已接收，执行结果下轮从 ledger 读取。")
+            parts.append("个人代理自身回复：在 localContent.eventTaskPath 同名的 .actions.json 文件写纯语义动作数组，调用 xphone.submit_task_actions，只填 eventTaskPath。")
         parts.append("当前事件与共享上下文：" + json.dumps(current, ensure_ascii=False, separators=(",", ":")))
         parts.append(self.template(record, "tool-reminder.md"))
         health = self.timed_note(record, "health.md")
@@ -128,7 +132,7 @@ class MuseContext:
         user_prompt = payload.get("prompt") or payload.get("text") or ""
         actors = [actor["name"] for actor in event.get("actors", [])]
         current = {
-            "packId": pack_id, "batchId": batch_id,
+            "packId": pack_id,
             "role": "os-agent", "stage": "post_journal_orchestration",
             "type": "journal.post_orchestration",
             "userPrompt": user_prompt,
@@ -148,7 +152,7 @@ class MuseContext:
             f"故事正文已保存。当前角色列表：{json.dumps(actors, ensure_ascii=False)}",
             f"请根据最新剧情进展与用户的交办指示规划联动。每项 App 动作都在云电脑目录 {current['localContent']['taskDirectory']} 写一份 <uuid4>.md 任务文档。“目标:”只能从 localContent.delegationTargets 复制完整值，再用 xphone.delegate_task 只提交文档绝对路径。若工具报目标不在列表，按返回的可用目标修正文档后重试。不得由 OS 直接提交私聊、地图、社媒、笔记或世界动作。",
             "如无需联动：直接回复“无需联动”。",
-            "当前上下文与批次：" + json.dumps(current, ensure_ascii=False, separators=(",", ":")),
+            "当前上下文：" + json.dumps(current, ensure_ascii=False, separators=(",", ":")),
             self.template(record, "tool-reminder.md"),
         ])
         health = self.timed_note(record, "health.md")
@@ -164,11 +168,6 @@ class MuseContext:
         delegated = {**record, "route": route}
         current = {
             "packId": record["packId"],
-            "batchId": batch,
-            "parentEventId": record["id"],
-            "step": step,
-            "targetApp": route["targetApp"],
-            "surfaceId": route["surfaceId"],
             "taskPath": task_path,
             "role": "subagent",
             "localContent": self.local_paths(delegated, route),

@@ -38,6 +38,7 @@ class ContentCache:
         (root / "docs").mkdir(parents=True, exist_ok=True)
         (root / "prompts").mkdir(parents=True, exist_ok=True)
         (root / playthrough_id / "tasks" / "delegations").mkdir(parents=True, exist_ok=True)
+        (root / playthrough_id / "tasks" / "events").mkdir(parents=True, exist_ok=True)
         memory = root / playthrough_id / "memory"
         memory.mkdir(parents=True, exist_ok=True)
         for name in ("summary.md", "pins.md"):
@@ -72,17 +73,16 @@ class ContentCache:
             self._write(path, content)
             if not source.startswith("content/config/agent-prompts/"):
                 path.chmod(0o600)
+        published = {item["path"] for item in manifest["runtimeAssets"]}
         for app in ("notes", "world", "characters", "photos"):
             path = root / "prompts" / "subagents" / f"{app}.md"
-            if not path.exists():
-                self._write(path, f"你是 XPhone {app} subagent。只执行本轮派给 {app} 的任务，先读本轮允许的本地故事文档，按连接器 action schema 提交动作；使用指定 batchId，完成后回复含 taskPath 的简短结果。\n")
+            if f"content/config/agent-prompts/subagents/{app}.md" not in published:
+                self._write(path, f"你是 XPhone {app} subagent。只执行本轮派给 {app} 的任务，先读本轮允许的本地故事文档，把纯语义动作数组写入任务文档同名 .actions.json，再用原任务文档路径调用 xphone.submit_task_actions。完成后回复含任务文档路径的简短结果。\n")
         templates = Path(__file__).parent / "prompts"
-        published = {item["path"] for item in manifest["runtimeAssets"]}
         for source, target in (("tool-hook.md", "tool-reminder.md"),
                                ("delegation-inject.md", "delegation-inject.md")):
-            if f"content/config/agent-prompts/{target}" not in published:
-                self._write(root / "prompts" / target,
-                            (templates / source).read_text(encoding="utf-8"))
+            self._write(root / "prompts" / target,
+                        (templates / source).read_text(encoding="utf-8"))
         actions = tool_data(mcp_call, "xphone.list_app_actions",
                             {"packId": pack_id, "playthroughId": playthrough_id})
         self._write(root / "prompts" / "app-actions.json",

@@ -2,7 +2,7 @@
 
 ## 核心执行规则（强制）
 1. 先用 `connector_search` 找到 `custom.xphone-agent-worker`，按下面的角色分工读取文档和选择工具。
-2. OS 直接提交 Journal 正文和自身回复。要让其他 App 做具体操作时，OS 在云电脑写一份任务文档，再把文档绝对路径交给 `xphone.delegate_task`；对应 App 的 subagent 读取文档并提交动作。工具返回只表示 subagent 已收到任务，完成结果稍后写入 ledger。
+2. OS 的 Journal 正文和自身回复写入本轮事件动作文件，再将事件任务文档路径交给 `xphone.submit_task_actions`。其他 App 操作由 OS 写派工文档，将文档路径交给 `xphone.delegate_task`；对应 App 的 subagent 读取文档、写同名动作文件，再用原任务文档路径调用 `xphone.submit_task_actions`。
 3. 回复用自然语言；动作以连接器调用和客户端应用回执为准，不要求旁聊输出 JSON。
 
 ## P0 必读（每轮开始先做）
@@ -44,8 +44,8 @@
 
 1. 根据本轮事件、已读文档与 `localContent.actionCatalog` 中本角色的 action schema 决定内容和语义目标。
 2. 私聊回复只说明角色与消息内容；不要手填 `threadId`、`from`、`actorId` 或 `actionId`。更新笔记和世界状态时也不要手填 revision。精确值由客户端解密动作后根据本轮事件及当前状态解析。
-3. OS 的非 Journal／自身回复动作：在 `localContent.taskDirectory` 创建一任务一文档，文件名为 `<uuid4>.md`，前三行依次为 `父事件: <taskDirectory 最后一段目录名>`、`目标: <localContent.delegationTargets 中的一项完整值>`、`任务: <自然语言任务>`，再调 `xphone.delegate_task({"taskPath":"文档的绝对路径"})`。目标不得自造写法；若工具报错，按返回的可用目标修正文档并重试。Worker 只转发路径，不读取任务正文；subagent 在云电脑读取文档后用连接器提交动作，批次必须关联本轮 `batchId`。
-4. 若上下文有 `previousRejectedBatchId`，这是上轮客户端拒收的批次；查看连接器/客户端反馈后修正语义内容，再用本轮 batch 提交，不要猜精确 ID。
+3. OS 的非 Journal／自身回复动作：在 `localContent.taskDirectory` 创建一任务一文档，文件名为 `<uuid4>.md`，前两行依次为 `目标: <localContent.delegationTargets 中的一项完整值>`、`任务: <自然语言任务>`，再调 `xphone.delegate_task({"taskPath":"文档的绝对路径"})`。目标不得自造写法；若工具报错，按返回的可用目标修正文档并重试。
+4. 写动作时，只在任务文档同目录写同名 `.actions.json` 纯语义动作数组，再调用 `xphone.submit_task_actions({"taskPath":"原任务文档的绝对路径"})`。OS 自身回复与 Journal 使用 `localContent.eventTaskPath`。若客户端拒收，按反馈修正语义内容并重新提交；不要猜批次或路由字段。
 
 ## 角色分工速查
 

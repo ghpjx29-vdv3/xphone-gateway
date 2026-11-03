@@ -27,6 +27,10 @@ class MuseCliError(Exception):
         self.reason = reason
 
 
+class AwaitingDelegations(Exception):
+    pass
+
+
 class LeaseRenewal:
     def __init__(self, mcp_call, event_id: str, lease_id: str, cancel: threading.Event | None):
         self.mcp_call, self.event_id, self.lease_id = mcp_call, event_id, lease_id
@@ -156,6 +160,27 @@ class MuseDispatch:
             else:
                 time.sleep(2)
 
+    def phase2_outcome(self, attempt: dict, mcp_call) -> str:
+        paths = attempt.get("delegations") or []
+        if not paths:
+            return "ready" if attempt.get("phase2NoLinkage") else "missing"
+        records = [self.state.get("delegations", {}).get(path) for path in paths]
+        if any(record is None for record in records):
+            return "missing"
+        records = [record for record in records if not record.get("superseded")]
+        if not records:
+            return "missing"
+        statuses = [delivery_status(mcp_call, record["batchId"]) for record in records]
+        if any(record.get("deliveryStatus") != status for record, status in zip(records, statuses)):
+            for record, status in zip(records, statuses):
+                record["deliveryStatus"] = status
+            self.save()
+        if all(status == "applied" for status in statuses):
+            return "ready"
+        if any(status == "rejected" for status in statuses):
+            return "rejected"
+        return "pending"
+
     def dispatch(self, items: list, mcp_call, playthrough_id: str, pack_id: str | None = None,
                  cancel: threading.Event | None = None) -> None:
         for item in sorted(items, key=lambda value: value["cursor"]):
@@ -172,6 +197,13 @@ class MuseDispatch:
                 mcp_call("xphone.ack_inbox", {"cursor": item["cursor"]})
                 path.unlink()
                 continue
+            attempt = self.state["events"].setdefault(event_id, {"failures": 0, "nextAt": 0})
+            if (not attempt.get("phase2Started") and attempt.get("step", 0) > 0
+                    and record["decrypted"].get("type") == "journal.main_record.requested"):
+                first_batch = batch_id(record["packId"], playthrough_id, event_id, 0)
+                if delivery_status(mcp_call, first_batch) == "applied":
+                    attempt.update({"phase2Started": True, "phase1Batch": first_batch})
+                    self.save()
             status = tool_data(mcp_call, "xphone.get_event_status", {"eventId": event_id})
             if status["status"] == "completed":
                 mcp_call("xphone.ack_inbox", {"cursor": item["cursor"]})
@@ -179,19 +211,60 @@ class MuseDispatch:
                 self.state["events"].pop(event_id, None)
                 self.save()
                 continue
-            if status["status"] == "running" and status["updatedAt"] + EVENT_LEASE_SECONDS * 1000 > time.time() * 1000:
+            lease_current = (status["status"] == "running" and
+                             status["updatedAt"] + EVENT_LEASE_SECONDS * 1000 > time.time() * 1000)
+            if attempt.get("phase2Started") and self.phase2_outcome(attempt, mcp_call) == "ready" and lease_current and attempt.get("leaseId"):
+                key, temporary = self.session_key(record)
+                self.finish(item, record, mcp_call, attempt["leaseId"], [attempt["phase1Batch"]],
+                            attempt.get("replyText", ""), "reply_text", key, temporary)
+                continue
+            if lease_current:
+                attempt["nextAt"] = status["updatedAt"] / 1000 + EVENT_LEASE_SECONDS + 1
+                self.save()
                 return
-            attempt = self.state["events"].setdefault(event_id, {"failures": 0, "nextAt": 0})
             if time.time() < attempt["nextAt"]:
                 return
             started = tool_data(mcp_call, "xphone.start_event", {"eventId": event_id})
             if not started.get("claimed"):
                 return
             lease_id = started["leaseId"]
+            attempt["leaseId"] = lease_id
+            self.save()
             try:
                 with LeaseRenewal(mcp_call, event_id, lease_id, cancel) as renewal:
                     event_type = record["decrypted"].get("type")
                     key, temporary = self.session_key(record)
+                    if attempt.get("phase2Started"):
+                        outcome = self.phase2_outcome(attempt, mcp_call)
+                        if outcome == "ready":
+                            self.finish(item, record, mcp_call, lease_id, [attempt["phase1Batch"]],
+                                        attempt.get("replyText", ""), "reply_text", key, temporary)
+                            continue
+                        if outcome == "pending":
+                            raise AwaitingDelegations("waiting for delegated actions to be applied")
+                        sid = self.session_id(key)
+                        post_prompt = self.context.post_journal_prompt(
+                            record, record["packId"], playthrough_id, attempt["batchId"],
+                            self.memory.view(record["packId"], playthrough_id, record["route"]),
+                            journal_summary=attempt.get("replyText", "")[:500])
+                        if outcome == "rejected":
+                            post_prompt += "\n\n已有派工被客户端拒收。请查看反馈，为同一目标新建任务文档并重新交办。"
+                        post_result = self.cli("send", post_prompt, "--thread", sid, "--wait", str(MUSE_WAIT_SECONDS))
+                        if post_result.get("sent") is not True:
+                            raise MuseCliError("send", reason="not-sent")
+                        post_reply = str((post_result.get("reply") or {}).get("text") or "")
+                        if post_reply:
+                            attempt["replyText"] = f"{attempt.get('replyText', '')}\n\n[Post-Journal]: {post_reply}"[:4000]
+                        attempt["phase2NoLinkage"] = "无需联动" in post_reply
+                        self.save()
+                        outcome = self.phase2_outcome(attempt, mcp_call)
+                        if outcome == "ready":
+                            self.finish(item, record, mcp_call, lease_id, [attempt["phase1Batch"]],
+                                        attempt.get("replyText", ""), "reply_text", key, temporary)
+                            continue
+                        if outcome == "pending":
+                            raise AwaitingDelegations("waiting for delegated actions to be applied")
+                        raise RuntimeError("post-journal 必须调用 delegate_task 或明确回复无需联动")
                     if event_type in ("app.foreground", "app.background"):
                         self.finish(item, record, mcp_call, lease_id, [], "", "lifecycle", key, False)
                         continue
@@ -246,6 +319,7 @@ class MuseDispatch:
                         post_step = 1
                         post_batch = batch_id(record["packId"], playthrough_id, event_id, post_step)
                         attempt.update({"step": post_step, "batchId": post_batch})
+                        attempt.update({"phase2Started": True, "phase1Batch": batch})
                         self.save()
                         post_status = delivery_status(mcp_call, post_batch)
                         if post_status == "unknown":
@@ -262,16 +336,13 @@ class MuseDispatch:
                             if post_reply:
                                 reply_text = f"{reply_text}\n\n[Post-Journal]: {post_reply}"
                             attempt["replyText"] = reply_text[:4000]
+                            attempt["phase2NoLinkage"] = "无需联动" in post_reply
                             self.save()
-                        post_status = delivery_status(mcp_call, post_batch)
-                        if not attempt.get("delegations") and (post_status != "unknown" or "无需联动" not in post_reply):
+                        outcome = self.phase2_outcome(attempt, mcp_call)
+                        if outcome == "pending":
+                            raise AwaitingDelegations("waiting for delegated actions to be applied")
+                        if outcome != "ready":
                             raise RuntimeError("post-journal 必须调用 delegate_task 或明确回复无需联动")
-                        if post_status == "applied":
-                            batches_completed.append(post_batch)
-                        elif post_status == "rejected":
-                            attempt.update({"step": post_step + 1, "rejectedBatchId": post_batch})
-                            self.save()
-                            raise RuntimeError("post-journal delivery rejected")
 
                     if not reply_text:
                         try:
@@ -289,6 +360,11 @@ class MuseDispatch:
                     self.finish(item, record, mcp_call, lease_id, batches_completed, reply_text,
                                 source, key, temporary)
                     continue
+            except AwaitingDelegations as error:
+                attempt["nextAt"] = time.time() + 30
+                self.save()
+                log.info("muse dispatch waiting: event=%s reason=%s", event_id, error)
+                return
             except Exception as error:
                 failures = attempt["failures"] + 1
                 delay = min(30 * 2 ** min(failures - 1, 5), 600)

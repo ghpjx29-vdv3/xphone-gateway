@@ -296,6 +296,11 @@ class Gateway:
                         raise WSClientError("websocket pong timeout")
                     await ws.send_text("ping")
                     awaiting_pong = True
+                    if self.muse_dispatch and any(
+                        attempt.get("nextAt") and attempt["nextAt"] <= time.time()
+                        for attempt in self.muse_dispatch.state["events"].values()
+                    ):
+                        await asyncio.to_thread(self.pull_inbox)
                     continue
                 if msg is None:
                     log.info("server closed connection")
@@ -334,6 +339,22 @@ class Gateway:
                                   request_id, str(error), traceback.format_exc())
                         await ws.send_text(json.dumps({"type": "delegate-ack", "requestId": request_id,
                                                        "ok": False, "error": str(error)}, ensure_ascii=False))
+                elif mtype == "submit-task-actions" and self.delegation:
+                    request_id = data.get("requestId")
+                    try:
+                        prepared = await asyncio.to_thread(
+                            self.delegation.prepare_actions, data.get("taskPath", ""),
+                            self.scope["packId"], self.scope["playthroughId"], self.key)
+                        await ws.send_text(json.dumps({"type": "submit-actions-ack",
+                                                       "requestId": request_id, "ok": True,
+                                                       **prepared}, ensure_ascii=False))
+                        log.info("action file sealed: request=%s batch=%s", request_id,
+                                 prepared["envelope"]["id"])
+                    except Exception as error:
+                        log.error("action file failed: request=%s error=%s", request_id, error)
+                        await ws.send_text(json.dumps({"type": "submit-actions-ack",
+                                                       "requestId": request_id, "ok": False,
+                                                       "error": str(error)}, ensure_ascii=False))
                 else:
                     log.debug("unhandled message type: %s", mtype)
         finally:

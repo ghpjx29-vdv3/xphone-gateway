@@ -4,7 +4,7 @@
 
 ## 这是什么（给新用户）
 
-Gateway 常驻在 Muse VM，主动连上 XPhone Worker 的 Agent WS。Worker 先持久化客户端事件，再发 WS 通知；Gateway 拉取并解密后，按角色构建 prompt，使用 `muse-cli send --wait 60` 唤醒对应 side chat。side chat 直接调用连接器提交 App action；Gateway 持续续租，核验客户端 `applied` 后才完成事件。低频 Hook 保留为故障兜底。架构与联调步骤见 [Muse 与前端联调指南](../docs/muse-front-end-integration.md)。
+Gateway 常驻在 Muse VM，主动连上 XPhone Worker 的 Agent WS。Worker 先持久化客户端事件，再发 WS 通知；Gateway 拉取并解密后，按角色构建 prompt，使用 `muse-cli send --wait 60` 唤醒对应 side chat。side chat 通过任务文件路径交付语义动作，由 Gateway 拼包加密；Gateway 核验客户端 `applied` 后才完成事件。低频 Hook 保留为故障兜底。当前协议与事务边界见 [路径交付与动作拼包架构](../docs/action-batch-architecture.md)，联调步骤见 [Muse 与前端联调指南](../docs/muse-front-end-integration.md)。
 
 ```
 ┌─ XPhone Worker (Cloudflare) ─────────────────┐
@@ -150,9 +150,9 @@ sudo systemctl restart xphone-gateway
 - `systemctl status xphone-gateway` 看状态；日志 `~/xphone/gateway/gateway.log`
 - **VM 会被替换**：`/etc` 是易失的，云主机替换后 systemd unit 会消失。配套 `watchdog.sh` + 定时任务（每 10 分钟）检查进程和最近健康时间；成功拉取、WebSocket pong 或普通手机模式检查都会更新健康时间。超过 5 分钟无健康信号时从 `xphone-gateway.service` 模板重装或重启。网关每次从服务端未确认队列的起点重扫，缺失的本地文件会重新生成。
 - **Muse 事件分发**：Gateway 按服务端 cursor 串行处理；OS 用户对话与角色私聊各有固定 side chat，OS 后台事件使用临时 side chat。映射、固定 batchId 与重试时间写在 `muse-dispatch.json`，共享摘要写在 `muse-memory.json`。失败按 30 秒起、最长 10 分钟退避；收到 `queued` 继续等待，只有客户端 `applied` 才确认事件。租约由独立线程每 30 秒续期，Hook 每 10 分钟检查一次作为故障兜底。
-- **云电脑内容树**：首次连接 pack 时，Gateway 从 MCP 拉取 manifest、全部故事文档、角色 prompt 与动作清单，在 `~/xphone/content/{packId}/` 建立 `docs/`、`prompts/` 和 `{playthroughId}/tasks/delegations/`、`{playthroughId}/memory/`。`prompts/` 包含 `tool-reminder.md`、`delegation-inject.md` 和 `app-actions.json`；`memory/` 初始化 `summary.md`、`pins.md`。后续旁聊按本轮给出的绝对路径直接读取这些文件。
-- **OS 交办 App 操作**：OS 在 `tasks/delegations/{eventId}/{uuid4}.md` 写父事件、目标 App／页面和自然语言任务，再调用 `xphone.delegate_task({"taskPath":"文档绝对路径"})`。Worker 只经现有 WS 转发路径；Gateway 读取文档并唤醒对应 subagent。接收确认不代表完成，客户端 `applied` 后摘要才写入 ledger；状态写在 `tasks/delegations/log.jsonl`。
-- **事件动作提交**：把动作数组写入 JSON 文件，调用 `submit_actions.py --pack-id <packId> --playthrough-id <playthroughId> --event-id <eventId> --step <固定步骤名> --actions-file <文件>`。同一事件重试时沿用步骤名；脚本先检查交付状态，再用稳定 ID 加密提交。
+- **云电脑内容树**：首次连接 pack 时，Gateway 从 MCP 拉取 manifest、全部故事文档、角色 prompt 与动作清单，在 `~/xphone/content/{packId}/` 建立 `docs/`、`prompts/` 和 `{playthroughId}/tasks/delegations/`、`{playthroughId}/tasks/events/`、`{playthroughId}/memory/`。`prompts/` 包含 `tool-reminder.md`、`delegation-inject.md` 和 `app-actions.json`；`memory/` 初始化 `summary.md`、`pins.md`。后续旁聊按本轮给出的绝对路径直接读取这些文件。
+- **派工与动作文件**：OS 在 `tasks/delegations/{eventId}/{uuid4}.md` 写封闭词表中的目标与自然语言任务，再调用 `xphone.delegate_task({"taskPath":"文档绝对路径"})`。subagent 在同目录写同名 `.actions.json` 语义动作数组，再调用 `xphone.submit_task_actions({"taskPath":"原任务文档绝对路径"})`。OS 自身回复和 Journal 使用 Gateway 创建的 `tasks/events/{eventId}/{eventId}.md`，同样写同名动作文件并只提交任务路径。Worker 只转发路径；Gateway 查派工或事件状态，生成 header 并加密正文。接收确认不代表完成，客户端 `applied` 后摘要才写入 ledger。
+- **事件事务边界**：Gateway 领取事件租约并启动 Muse；Journal Phase 2 的派工记录在父事件状态中。子批次异步 `applied` 时，Gateway 查询该父事件全部派工状态；全部应用后由 Gateway 调用 `finish_event`，再按 cursor 确认 inbox。等待中的派工不计入失败次数；WS 空闲时只在本地重试时间到期后重新拉取，避免无事件轮询。receipt 仍遵循 Worker 的顺序 ack，不能越过未完成的早期事件。
 - **worker 卡住告警**：`lease-stuck-monitor.sh` + 定时任务（每 30 分钟）。Gateway 按上面的退避规则重试，Hook 每 10 分钟兜底；若文件仍超过 30 分钟未完成，需要查看 Gateway 和 MCP 错误。监控只告警，不替处理者调用 `finish_event`。
 - 手动暂停维护：`touch ~/xphone/gateway/PAUSED`，watchdog 与卡住监控都会跳过
 
@@ -178,10 +178,10 @@ CRON_TZ=Asia/Taipei
 3. **非标准 101**：Cloudflare 回的 101 带 `Connection: close`，`websockets`/`websocket-client` 两库都判非法。本项目自研最小 WS 客户端（`wsclient.py`），手动 CONNECT 隧道 + TLS + 握手。
 4. **ticket 一次性**：`open_event_stream` 的票 60 秒有效，一次一用；断线重取。单存档同时只允许一个 Agent WS（409 冲突）。
 5. **加密**：AES-256-GCM，key=base64url 解码 32 字节，nonce 12 字节随机，AAD=base64url 解码后的 aad 字节；ciphertext 含 16 字节 tag。事件 AAD 含明文 `route`（role/roleId/windowId/consumer）。
-6. **动作提交**：明文 `{"batchId","actions"}`；AAD=`{"v":1,"packId":..,"playthroughId":..,"direction":"client","kind":"action_batch","id":<batchId>}`（**无 route**、key 顺序固定、紧凑序列化）；envelope.id=batchId；重试沿用 batchId 防重。
+6. **动作提交**：`action_batch` 只接受 v2。envelope 明文 header 含 `batchId`、`parentEventId`、`step`、`targetApp`、`surfaceId`、`origin`，并整体进入 AAD；正文只含语义动作，仍由 AES-256-GCM 加密。`envelope.id=header.batchId`。模型不填写批次或路由字段。
 7. **顺序 ack**：服务端要求按 cursor 顺序 `ack_inbox`；Gateway 每次只分发最早的未完成事件，Hook 兜底时也只唤醒最早的本地文件。
 8. **receipt 非工作事件**：`start_event` 会被拒，直接 `get_delivery` 核验后 ack。
-9. **accepted ≠ applied**：`submit_action_batch` 返回的 accepted 只代表服务端入队，不代表客户端落地。必须用 `xphone.get_delivery` 复核最终状态（applied / rejected / queued），rejected 的 batch 内容实际从未到达客户端。
+9. **accepted ≠ applied**：`submit_task_actions` 返回的 accepted 只代表服务端入队，不代表客户端落地。Gateway 用 `xphone.get_delivery` 复核最终状态（applied / rejected / queued）。
 10. **actor 强绑定**：客户端按 `policy.threadActors[threadId] === action.from` 严格校验。`messages.append` 的 `from` 必须与目标 threadId 绑定的角色名**精确一致**（如在晚舟的 threadId 里填 `from: "顾骁"` 会被安全策略以 `Invalid Messages actor or content` 拒绝）。提交前务必核对 threadId↔角色映射。
 11. **手动与 hook 互斥**：人工手动处理 inbox 文件时，hook 轮询可能同时处理同一批事件，导致重复提交。手动介入前先 `touch ~/xphone/gateway/PAUSED` 暂停自动处理，完事再删掉。
 12. **社媒主帖 vs 评论**：`socialmedia.applyBatch` 中 `operation: 'appendPost'` 发独立主帖（Timeline 展示）；要在帖子详情评论区回复必须用 `operation: 'appendComment'`（字段：`platform`、`postId`、`author`、`text`），前端才会存入评论区并在详情页展开。

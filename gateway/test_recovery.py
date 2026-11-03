@@ -11,7 +11,6 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import gateway as gateway_module
-import submit_actions
 import call_mcp
 
 
@@ -140,30 +139,6 @@ class RetainedInboxTests(unittest.TestCase):
         self.assertEqual(socket.sent, ["ping"])
         self.assertTrue(socket.closed)
         self.assertEqual(scope_check.call_count, 1)
-
-    def test_replayed_action_uses_same_ids_without_resubmission(self):
-        delivery = {"status": "unknown"}
-        submitted = []
-
-        def submit(actions, pack_id, playthrough_id, batch_id):
-            submitted.append((batch_id, actions[0]["actionId"]))
-            return batch_id
-
-        def mcp(name, args):
-            return {"content": [{"text": json.dumps(delivery)}]}
-
-        with patch.object(submit_actions, "mcp_call", side_effect=mcp), patch.object(
-            submit_actions, "submit_batch", side_effect=submit
-        ):
-            first = submit_actions.submit_event_actions("event-1", "reply", [{}], "pack", "playthrough")
-            retry = submit_actions.submit_event_actions("event-1", "reply", [{}], "pack", "playthrough")
-            delivery["status"] = "queued"
-            second = submit_actions.submit_event_actions("event-1", "reply", [{}], "pack", "playthrough")
-        self.assertEqual(first, retry)
-        self.assertEqual(first, second)
-        self.assertEqual(len(submitted), 2)
-        self.assertEqual(submitted[0], submitted[1])
-        self.assertEqual(submitted[0][0], first)
 
     def test_call_mcp_tool_invocation_and_session_caching(self):
         fake_sess = {
