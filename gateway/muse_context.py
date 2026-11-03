@@ -163,12 +163,13 @@ class MuseContext:
                          task_path: str, memory: dict, first_turn: bool) -> str:
         delegated = {**record, "route": route}
         current = {
-            "packId": record["packId"], "playthroughId": record["playthroughId"],
-            "parentEventId": record["id"], "eventId": record["id"],
-            "step": step, "batchId": batch, "taskPath": task_path,
-            "role": "subagent", "targetApp": route["targetApp"],
-            "surfaceId": route["surfaceId"], "consumer": route["consumer"],
-            "localContent": self.local_paths(delegated, route), "sharedMemory": memory,
+            "packId": record["packId"],
+            "batchId": batch,
+            "taskPath": task_path,
+            "role": "subagent",
+            "targetApp": route["targetApp"],
+            "localContent": self.local_paths(delegated, route),
+            "sharedMemory": memory,
         }
         parts = []
         if first_turn:

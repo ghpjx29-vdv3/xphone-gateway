@@ -129,7 +129,7 @@ class Delegation:
             parent, route, batch, step, task_path, memory,
             self.dispatcher.state["promptVersions"].get(session_key) != self.dispatcher.context.version())
         try:
-            result = self.dispatcher.cli("send", prompt, "--thread", session_id, "--wait", "0")
+            result = self.dispatcher.cli("send", prompt, "--thread", session_id, "--wait", "60")
             if result.get("sent") is not True:
                 raise RuntimeError("Muse 未确认任务送达")
         except Exception:
