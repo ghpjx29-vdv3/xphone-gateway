@@ -74,3 +74,33 @@
 - 世界变量目前仅能用已声明变量 ID 或唯一的末段名称匹配；故事包若只给中文别名、没有变量映射，客户端会拒绝未知变量。
 - 地图位置优先使用当前地图事件与本地地点目录；未加载到客户端的地点不会靠模型猜 ID。
 - 前端仓库本来有大量其他未提交改动，本轮只涉及 `src/agentruntime/remoteAgentRuntime.ts` 与新增的 `semanticActionTargets.ts`。联调时使用当前本地前端构建即可。
+
+---
+
+## 联调验证成果与结论 (Integration Test Report)
+
+本次联调基于目标故事包 **`圣埃斯佩兰萨的棠`（Paradise Lost 中文包，`packId: 圣埃斯佩兰萨的棠-456f3930`）** 开展，通过 Chrome DevTools MCP 与 Muse AI 助理实时协同，对所有 4 个核心场景进行了全链路闭环验证：
+
+### 1. 验证结果汇总
+
+| 轮次 | 测试场景 | 核心动作与实体 | 验证状态 | 关键指标与观测 |
+| :--- | :--- | :--- | :---: | :--- |
+| **Round 1** | **晚舟私聊语义 Action** | 门主在 Messages 询问街口黑车；晚舟回复并给出路线 | **PASSED** | 客户端 `semanticActionTargets` 精准匹配中文名「晚舟」到内部 ID `wan_zhou:role` (Thread: `Wade`)，无任何技术 ID 猜写，1 次即 `applied`。 |
+| **Round 2** | **私聊增量 Context 复用** | 同一私聊发送追问（汇合时间与暗号确认） | **PASSED** | 复用同一 Muse Session；Prompt 仅携带增量对话与工具 hook；晚舟在数秒内回复确认。 |
+| **Round 3** | **OS 对话与其他动作 (Notes)** | 门主向 Muse 询问势力分布并要求新建《今晚接头安排》备忘 | **PASSED** | Muse 回复势力简报并调用 `notes.create`；打开 XPhone 备忘录 App 确认《今晚接头安排》已完整入库。 |
+| **Round 4** | **故事续写 → 触发写作 → 派工联动 (Two-Phase)** | 在故事 App 输入夜间动身续写指令；触发写作与角色后续派工 | **PASSED** | **Phase 1**：OS Agent 成功流式生成并提交正文《暮色之前》（含晚舟备车与暗哨联动），打字机效果落盘成篇；<br>**Phase 2**：网关自动平滑过渡到第二阶段，晚舟私聊紧接着更新并衔接剧情。 |
+
+### 2. 联调中攻克的关键 Bug 与架构优化
+
+1. **客户端语义目标两阶段保持 (`semanticActionTargets.ts`)**：
+   - 规则：GIGI 运行时严格要求 `journal.appendMainRecord` 单独提交。
+   - 修复：当 `target.surfaceId === 'journal.main_record' && target.step === 0 && applied` 时，不立即销毁目标，而是递进到 `step: 1`，使 Gateway 能够无缝派发 Phase 2 派工指令。
+2. **中英文角色显示名自适应消歧 (`matchActor`)**：
+   - 支持 `entry.name === trimmed || entry.actorId === trimmed || entry.actorId.split(':')[0] === trimmed`，彻底解决模型输出「晚舟」与客户端注册名「Wade」之间的命名鸿沟。
+3. **Ledger 空条目过滤与模型注意力保护 (`muse_memory.py`)**：
+   - 问题发现：用户与 Muse 交流中发现 `muse-memory.json` 中积累大量 `source: "lifecycle"` 且 `summary: ""` 的空条目，被网关原样注入 prompt 浪费上千 token。
+   - 优化：在 `MuseMemory.view()` 中过滤掉无 summary 的空条目，且剔除内部传输字段 `eventId`、`batchIds`，仅保留核心语义，保护模型注意力和上下文窗口。
+4. **网关 Deferred Dispatch 异常堆栈追踪 (`muse_dispatch.py`)**：
+   - 在网关重试退避日志中引入 `traceback.format_exc()` 与完整 `str(error)`，终结了以往仅有 `reason=RuntimeError` 的日志盲猜问题。
+
+至此，XPhone 架构中“故事续写 → 触发写作 → OS Agent 派工给 Subagent”双阶段闭环及所有语义 Action 联调目标**全部达成并通过**。
