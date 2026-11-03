@@ -81,7 +81,7 @@ class Gateway:
         os.makedirs(os.path.dirname(HEALTH_PATH), exist_ok=True)
         tmp = HEALTH_PATH + ".tmp"
         with open(tmp, "w") as f:
-            json.dump({"lastSuccessfulPull": int(time.time())}, f)
+            json.dump({"lastHealthyAt": int(time.time())}, f)
         os.replace(tmp, HEALTH_PATH)
 
     def _record_scope(self, scope: dict | None, mcp_url: str | None) -> None:
@@ -285,8 +285,8 @@ class Gateway:
             await asyncio.to_thread(self.pull_inbox)
             awaiting_pong = False
             while not self._stop.is_set():
-                if int(time.time() * 1000) + 60_000 >= session_expires_at or await asyncio.to_thread(active_scope) != self.scope:
-                    log.info("active pack changed; reconnecting")
+                if int(time.time() * 1000) + 60_000 >= session_expires_at:
+                    log.info("pack session expiring; reconnecting")
                     break
                 try:
                     msg = await asyncio.wait_for(ws.recv_text(),
@@ -300,6 +300,7 @@ class Gateway:
                 if msg is None:
                     log.info("server closed connection")
                     break
+                self._record_health()
                 if msg == "pong":
                     awaiting_pong = False
                     continue
@@ -320,12 +321,14 @@ class Gateway:
                     await asyncio.to_thread(self.pull_inbox)
                 elif mtype == "delegate-task" and self.delegation:
                     request_id = data.get("requestId")
+                    log.info("delegation request received: request=%s", request_id)
                     try:
                         result = await asyncio.to_thread(self.delegation.accept, data.get("taskPath", ""),
                                                          self.scope["packId"], self.scope["playthroughId"])
                         await ws.send_text(json.dumps({"type": "delegate-ack", "requestId": request_id,
                                                        "ok": True, "targetApp": result["targetApp"],
                                                        "batchId": result["batchId"]}))
+                        log.info("delegation acknowledged: request=%s", request_id)
                     except Exception as error:
                         log.error("delegation failed: request=%s error=%s\n%s",
                                   request_id, str(error), traceback.format_exc())

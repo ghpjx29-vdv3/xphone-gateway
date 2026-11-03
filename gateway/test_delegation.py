@@ -59,7 +59,7 @@ class DelegationTests(unittest.TestCase):
             task_path = task_root / "event-1" / "123e4567-e89b-42d3-a456-426614174000.md"
             task_path.parent.mkdir()
             secret_task = "让晚舟告诉用户码头今晚换班。"
-            task_path.write_text(f"父事件: event-1\n目标: messages / 晚舟私信\n任务: {secret_task}\n", encoding="utf-8")
+            task_path.write_text(f"父事件: event-1\n目标: messages / 晚舟 DM\n任务: {secret_task}\n", encoding="utf-8")
             sent = []
 
             def cli(*args):
@@ -74,11 +74,17 @@ class DelegationTests(unittest.TestCase):
 
             dispatcher.cli = cli
             delegation = Delegation(dispatcher, cache.base)
+            with self.assertRaisesRegex(ValueError, "可交办列表.*messages / 晚舟"):
+                delegation.accept(str(task_path), "pack", "play")
+            task_path.write_text(f"父事件: event-1\n目标: messages / 晚舟\n任务: {secret_task}\n", encoding="utf-8")
             ack = delegation.accept(str(task_path), "pack", "play")
             self.assertEqual(ack["taskPath"], str(task_path))
             self.assertEqual(ack["targetApp"], "messages")
             self.assertIn(f"打开任务文档：{task_path}", sent[0])
             self.assertNotIn(secret_task, sent[0])
+            self.assertIn("messages / 晚舟", dispatcher.context.prompt(record, "pack", "play", "batch-1", {}, False))
+            with self.assertRaisesRegex(RuntimeError, "已交办"):
+                delegation.accept(str(task_path), "pack", "play")
             self.assertEqual([name for name, _ in calls].count("runtime.read_document"), 1)
 
             delegation.poll(mcp, "pack", "play")

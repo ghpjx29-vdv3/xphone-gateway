@@ -44,7 +44,7 @@
 
 1. 根据本轮事件、已读文档与 `localContent.actionCatalog` 中本角色的 action schema 决定内容和语义目标。
 2. 私聊回复只说明角色与消息内容；不要手填 `threadId`、`from`、`actorId` 或 `actionId`。更新笔记和世界状态时也不要手填 revision。精确值由客户端解密动作后根据本轮事件及当前状态解析。
-3. OS 的非 Journal／自身回复动作：在 `localContent.taskDirectory` 创建一任务一文档，文件名为 `<uuid4>.md`，前三行依次为 `父事件: <eventId>`、`目标: <App> / <页面>`、`任务: <自然语言任务>`，再调 `xphone.delegate_task({"taskPath":"文档的绝对路径"})`。Worker 只转发路径，不读取任务正文；subagent 在云电脑读取文档后用连接器提交动作，批次必须关联本轮 `batchId`。
+3. OS 的非 Journal／自身回复动作：在 `localContent.taskDirectory` 创建一任务一文档，文件名为 `<uuid4>.md`，前三行依次为 `父事件: <taskDirectory 最后一段目录名>`、`目标: <localContent.delegationTargets 中的一项完整值>`、`任务: <自然语言任务>`，再调 `xphone.delegate_task({"taskPath":"文档的绝对路径"})`。目标不得自造写法；若工具报错，按返回的可用目标修正文档并重试。Worker 只转发路径，不读取任务正文；subagent 在云电脑读取文档后用连接器提交动作，批次必须关联本轮 `batchId`。
 4. 若上下文有 `previousRejectedBatchId`，这是上轮客户端拒收的批次；查看连接器/客户端反馈后修正语义内容，再用本轮 batch 提交，不要猜精确 ID。
 
 ## 角色分工速查

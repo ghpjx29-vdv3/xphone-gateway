@@ -63,7 +63,7 @@ batch 的 delivery→applied，或检测该用户 agent WS 在线）。
    sudo systemctl daemon-reload && sudo systemctl enable --now xphone-gateway`
    （已安装则为重装+重启）。服务模板选择 Muse provider；如需出站代理，先配好 `proxy.env`。若 systemd 找不到 CLI，在该文件写入 `XPHONE_MUSE_CLI=/绝对路径/muse-cli`。将 Hook 脚本同步到 `~/hooks/scripts/xphone-inbox.sh`，并通过 Muse 的 Hook 管理工具把已注册 Hook 的 `poll_interval_secs` 更新为 600；只复制 JSON 文件不会更新已注册配置。
 7. **装 watchdog**：按「运行与自愈」把 `watchdog.sh` 加入定时任务（每 10 分钟）。
-   （云主机约每 2 小时被回收一次，watchdog 检查最近成功拉取时间并恢复；重启后重新拉取服务端未确认事件。）
+   （云主机约每 2 小时被回收一次，watchdog 检查进程与连接健康时间并恢复；重启后重新拉取服务端未确认事件。）
 8. **验证**：`~/xphone/gateway/gateway.log` 应出现取票成功、WS 已连接、`inbox write` 和 `muse event completed`。Gateway 通过专用会话负责事件领取、续租与完成。
 9. **冒泡测试**（必须做）：用 `submit_actions.py --pack-id <packId> --playthrough-id <playthroughId>` 提交一条 `agent.reply` 测试消息
    （`messageId`=`bubble-<时间戳>` 唯一，`text`=`🫧 冒泡测试：网关链路正常`，
@@ -148,7 +148,7 @@ sudo systemctl restart xphone-gateway
 ## 运行与自愈
 
 - `systemctl status xphone-gateway` 看状态；日志 `~/xphone/gateway/gateway.log`
-- **VM 会被替换**：`/etc` 是易失的，云主机替换后 systemd unit 会消失。配套 `watchdog.sh` + 定时任务（每 10 分钟）检查进程和最近成功拉取时间；异常时从 `xphone-gateway.service` 模板重装或重启。网关每次从服务端未确认队列的起点重扫，缺失的本地文件会重新生成。
+- **VM 会被替换**：`/etc` 是易失的，云主机替换后 systemd unit 会消失。配套 `watchdog.sh` + 定时任务（每 10 分钟）检查进程和最近健康时间；成功拉取、WebSocket pong 或普通手机模式检查都会更新健康时间。超过 5 分钟无健康信号时从 `xphone-gateway.service` 模板重装或重启。网关每次从服务端未确认队列的起点重扫，缺失的本地文件会重新生成。
 - **Muse 事件分发**：Gateway 按服务端 cursor 串行处理；OS 用户对话与角色私聊各有固定 side chat，OS 后台事件使用临时 side chat。映射、固定 batchId 与重试时间写在 `muse-dispatch.json`，共享摘要写在 `muse-memory.json`。失败按 30 秒起、最长 10 分钟退避；收到 `queued` 继续等待，只有客户端 `applied` 才确认事件。租约由独立线程每 30 秒续期，Hook 每 10 分钟检查一次作为故障兜底。
 - **云电脑内容树**：首次连接 pack 时，Gateway 从 MCP 拉取 manifest、全部故事文档、角色 prompt 与动作清单，在 `~/xphone/content/{packId}/` 建立 `docs/`、`prompts/` 和 `{playthroughId}/tasks/delegations/`、`{playthroughId}/memory/`。`prompts/` 包含 `tool-reminder.md`、`delegation-inject.md` 和 `app-actions.json`；`memory/` 初始化 `summary.md`、`pins.md`。后续旁聊按本轮给出的绝对路径直接读取这些文件。
 - **OS 交办 App 操作**：OS 在 `tasks/delegations/{eventId}/{uuid4}.md` 写父事件、目标 App／页面和自然语言任务，再调用 `xphone.delegate_task({"taskPath":"文档绝对路径"})`。Worker 只经现有 WS 转发路径；Gateway 读取文档并唤醒对应 subagent。接收确认不代表完成，客户端 `applied` 后摘要才写入 ledger；状态写在 `tasks/delegations/log.jsonl`。

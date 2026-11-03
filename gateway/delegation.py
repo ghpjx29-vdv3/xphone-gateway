@@ -13,7 +13,19 @@ from muse_delivery import batch_id, delivery_status
 
 log = logging.getLogger("xphone-gateway")
 TASK_NAME = re.compile(r"^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}\.md$")
-APPS = {"messages", "maps", "socialmedia", "notes", "world", "characters", "photos"}
+APP_TARGETS = {
+    "maps / 地图": ("maps", "maps.active", "maps"),
+    "socialmedia / 社交动态": ("socialmedia", "socialmedia.feed", "socialmedia"),
+    "notes / 备忘录": ("notes", "notes.active", "os"),
+    "world / 世界": ("world", "world.active", "os"),
+    "characters / 人物": ("characters", "characters.active", "os"),
+    "photos / 相册": ("photos", "photos.active", "os"),
+}
+
+
+def target_options(parent: dict) -> list[str]:
+    return [*(f"messages / {actor['name']}" for actor in parent["decrypted"].get("actors") or []),
+            *APP_TARGETS]
 
 
 def route_part(value: str) -> str:
@@ -38,25 +50,24 @@ class Delegation:
         target = lines[1][4:].strip()
         task = "\n".join([lines[2][4:].strip(), *lines[3:]]).strip()
         app, separator, page = target.partition(" / ")
-        if not parent or not separator or app not in APPS or not page or not task:
-            raise ValueError("任务文件的父事件、目标 App／页面和任务均必填")
+        if not parent or not separator or not app or not page or not task:
+            raise ValueError("任务文件须填写父事件和任务；“目标:”请从本轮 localContent.delegationTargets 逐字复制完整值，修改后重新调用 xphone.delegate_task")
         return parent, app, page, task
 
     @staticmethod
     def route(parent: dict, app: str, page: str) -> dict:
         window = parent["route"]["windowId"]
+        target = f"{app} / {page}"
+        options = target_options(parent)
+        if target not in options:
+            raise ValueError(f"目标“{target}”不在本轮可交办列表中。请把任务文档的“目标:”改为以下完整值之一，再调用 xphone.delegate_task：{'、'.join(options)}")
         if app == "messages":
-            name = page.removesuffix("私信").strip()
-            actors = parent["decrypted"].get("actors") or []
-            matches = [actor for actor in actors if name in (actor.get("name"), actor.get("actorId"))]
-            if len(matches) != 1:
-                raise ValueError(f"Messages 目标不唯一或不存在：{page}")
-            actor_id = matches[0]["actorId"]
+            actor_id = next(actor["actorId"] for actor in parent["decrypted"]["actors"]
+                            if actor["name"] == page)
             surface, consumer = f"messages.dm.{actor_id}", f"messages.{actor_id}"
             prefix = "storyMessagesToolsV1"
         else:
-            surface = "maps.active" if app == "maps" else page
-            consumer = "os" if app in {"notes", "world", "characters", "photos"} else app
+            _, surface, consumer = APP_TARGETS[target]
             prefix = "storyPromptV1"
         role_id = f"subagent:{prefix}:{app}:{route_part(window)}:{route_part(surface)}"
         return {"role": "subagent", "roleId": role_id, "targetApp": app,
@@ -79,9 +90,11 @@ class Delegation:
         key = str(path)
         existing = self.dispatcher.state["delegations"].get(key)
         if existing:
-            if existing["status"] in ("sent", "applied"):
+            if existing["status"] == "applied":
                 return {"status": "delegated", "taskPath": task_path,
                         "targetApp": existing["route"]["targetApp"], "batchId": existing["batchId"]}
+            if existing["status"] == "sent":
+                raise RuntimeError("这份任务文档已交办，尚未收到客户端 applied；修改任务请新建 <uuid4>.md 文件，不能原地修改后重试")
             if existing["status"] == "rejected":
                 raise RuntimeError("任务已被客户端拒收，请新建任务文件")
         if not path.exists():

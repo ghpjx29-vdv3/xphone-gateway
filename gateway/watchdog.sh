@@ -11,21 +11,22 @@ UNIT_SRC="$GW_DIR/xphone-gateway.service"
 UNIT_DST="/etc/systemd/system/xphone-gateway.service"
 LOG="$GW_DIR/watchdog.log"
 HEALTH="$GW_DIR/health.json"
-STALE_AFTER_SECONDS=180
+STALE_AFTER_SECONDS=300
 PAUSED="$GW_DIR/PAUSED"
 
 log() { echo "$(date -u +%FT%TZ) $*" >> "$LOG"; }
 [ -f "$PAUSED" ] && exit 0
 
-# 1. A live process must also be pulling the retained inbox successfully.
+# 1. A live process must have a recent successful inbox pull, WS pong, or
+# normal-mode scope check. Idle Agent packs do not pull the inbox on a timer.
 if pgrep -f "[g]ateway.py" > /dev/null 2>&1 && [ -f "$HEALTH" ]; then
-  last_pull=$(stat -c %Y "$HEALTH")
-  if [ $(( $(date +%s) - last_pull )) -lt "$STALE_AFTER_SECONDS" ]; then
+  last_healthy=$(stat -c %Y "$HEALTH")
+  if [ $(( $(date +%s) - last_healthy )) -lt "$STALE_AFTER_SECONDS" ]; then
     exit 0
   fi
 fi
 
-log "watchdog: gateway missing or inbox pull stale, recovering"
+log "watchdog: gateway missing or connection health stale, recovering"
 
 # 2. Unit file present? (lost on VM replacement)
 if [ ! -f "$UNIT_DST" ]; then

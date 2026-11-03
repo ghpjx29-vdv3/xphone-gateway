@@ -131,7 +131,7 @@ class RetainedInboxTests(unittest.TestCase):
         self.gateway.pull_inbox = lambda: None
         with patch.object(gateway_module, "WSClient", return_value=socket), patch.object(
             gateway_module, "PING_INTERVAL", 0.01
-        ), patch.object(gateway_module, "active_scope", return_value={"packId": "pack"}), patch.object(
+        ), patch.object(gateway_module, "active_scope", return_value={"packId": "pack"}) as scope_check, patch.object(
             gateway_module, "session", return_value={"token": "token", "mcpUrl": "https://worker.example/mcp",
                                                     "scope": {"packId": "pack"}, "expiresAt": 9999999999999}
         ):
@@ -139,6 +139,7 @@ class RetainedInboxTests(unittest.TestCase):
                 asyncio.run(self.gateway.run_once())
         self.assertEqual(socket.sent, ["ping"])
         self.assertTrue(socket.closed)
+        self.assertEqual(scope_check.call_count, 1)
 
     def test_replayed_action_uses_same_ids_without_resubmission(self):
         delivery = {"status": "unknown"}
