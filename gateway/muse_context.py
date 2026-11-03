@@ -165,9 +165,12 @@ class MuseContext:
         current = {
             "packId": record["packId"],
             "batchId": batch,
+            "parentEventId": record["id"],
+            "step": step,
+            "targetApp": route["targetApp"],
+            "surfaceId": route["surfaceId"],
             "taskPath": task_path,
             "role": "subagent",
-            "targetApp": route["targetApp"],
             "localContent": self.local_paths(delegated, route),
             "sharedMemory": memory,
         }
