@@ -1,8 +1,10 @@
 # Muse 与 XPhone 前端联调
 
+本轮语义 Action、按需读文档和每轮 hook 的实测步骤见 [semantic-actions-sidechat-integration.md](semantic-actions-sidechat-integration.md)。以下保留 Gateway 与 Worker 的基础部署、租约和 delivery 检查。
+
 ## 版本与安装
 
-先部署与本指南同一次提交的 Worker，再更新 Muse VM 的 Gateway。Gateway 使用 `/account/gateway-session` 获取短期会话；Muse 连接器使用普通 `/mcp` 凭证。普通连接器不能调用 Gateway 专用的 `runtime.*` 和事件租约写入工具。
+先部署与本指南同一次提交的 Worker，再更新 Muse VM 的 Gateway。Gateway 使用 `/account/gateway-session` 获取短期会话；Muse 旁聊通过内置 XPhone 连接器读取角色文档并执行动作。
 
 在 Muse VM 更新：
 
@@ -21,7 +23,7 @@ tail -n 80 gateway.log
 ## Muse 侧检查
 
 1. 普通 XPhone 连接器能找到提交 App action、发送角色消息所需工具，以及 `xphone.get_delivery`、`story.get_context`、`story.read_reference`。故事工具同时传本轮 `eventId` 和 route 中的 `consumer`。若连接器 schema 未显示 eventId，刷新连接器定义。
-2. 普通连接器的 `tools/list` 不应列出 `runtime.read_asset`、`xphone.finish_event`。Gateway 自己的短期会话仍可调用这些工具。
+2. 在 Muse 旁聊实际使用的连接器中核对角色文档读取工具；`xphone.finish_event` 是 Gateway 的事件管理动作，旁聊不用调用。
 3. 发一条 OS 用户消息。Gateway 日志应出现 `inbox write`、`muse session created`、`muse event completed`。Muse side chat 用本轮固定 batchId 提交加密 App action；客户端 `applied` 后，Gateway 才写入 `muse-memory.json` 并确认事件。
 4. 对同一角色连续发两条 Messages 消息，确认复用该角色旁聊；换另一个角色，确认进入另一旁聊。OS 后台事件使用临时旁聊，完成后删除。普通 OS 对话保持固定旁聊。
 5. 角色调用 `story.get_context({"eventId":"本轮事件 ID","consumer":"本轮 route.consumer"})` 后按需读取 `story.read_reference({"eventId":"本轮事件 ID","consumer":"本轮 route.consumer","referenceId":"索引中的 ID"})`；伪造 consumer 或读取不属于该 route 的 reference 应被拒绝。当前是 event route 级授权，共享连接器凭证不区分具体旁聊身份。

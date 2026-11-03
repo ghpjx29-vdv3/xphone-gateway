@@ -95,25 +95,17 @@ class MuseDispatchTests(unittest.TestCase):
         self.dispatcher.dispatch([self.item], self.mcp, "play", pack_id="pack")
         self.assertTrue(any(name == "xphone.finish_event" for name, _ in self.calls))
 
-    def test_subagent_prompt_has_only_its_action_and_reference_index(self):
-        def mcp(name, args):
-            if name == "runtime.list_assets":
-                return result({"version": "1", "paths": ["content/config/agent-prompts/subagents/messages.md"]})
-            if name == "runtime.read_asset":
-                return result({"content": "Worker role prompt: {{knownInformation}}"})
-            if name == "xphone.list_app_actions":
-                return result({"actions": [{"type": "messages.append", "role": "messages subagent"},
-                                           {"type": "characters.create", "role": "os-agent"}]})
-            if name == "story.get_context":
-                self.assertEqual(args, {"eventId": "event-1", "consumer": "messages.alice"})
-                return result({"references": [{"id": "alice", "title": "Alice", "summary": "角色资料"}]})
-            raise AssertionError(name)
-
-        prompt = MuseContext().prompt(self.record, "pack", "play", "batch", {}, mcp)
-        self.assertIn("messages.append", prompt)
-        self.assertIn("Worker role prompt", prompt)
-        self.assertIn("角色资料", prompt)
-        self.assertNotIn('"type": "characters.create"', prompt)
+    def test_subagent_followup_keeps_event_and_hook_without_role_prompt(self):
+        context = MuseContext()
+        first = context.prompt(self.record, "pack", "play", "batch", {}, True)
+        followup = context.prompt(self.record, "pack", "play", "batch", {}, False)
+        self.assertIn("connector_search", first)
+        self.assertIn("当前事件与共享上下文", followup)
+        self.assertIn("story.get_context", followup)
+        self.assertIn("xphone.submit_action_batch", followup)
+        self.assertNotIn("## P0 必读", followup)
+        self.assertNotIn("threadId", followup)
+        self.assertLess(len(followup), len(first) * 0.3)
 
 
 if __name__ == "__main__":

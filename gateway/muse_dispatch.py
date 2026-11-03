@@ -66,6 +66,7 @@ class MuseDispatch:
         }
         self.memory = MuseMemory(str(self.state_path.with_name("muse-memory.json")))
         self.context = MuseContext()
+        self.state.setdefault("promptVersions", {})
 
     def save(self) -> None:
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -109,6 +110,14 @@ class MuseDispatch:
             log.info("muse session created: key=%s", key)
         return sessions[key]
 
+    def rejection_reason(self, batch: str | None) -> str | None:
+        if not batch:
+            return None
+        receipt = self.inbox / f"receipt.{batch}.json"
+        if not receipt.exists():
+            return None
+        return json.loads(receipt.read_text(encoding="utf-8"))["decrypted"].get("reason")
+
     def finish(self, item: dict, record: dict, mcp_call, lease_id: str, batches: list[str],
                reply_text: str, source: str, key: str, temporary: bool) -> None:
         event_id = record["id"]
@@ -123,6 +132,7 @@ class MuseDispatch:
             try:
                 self.cli("session-delete", self.state["sessions"][key])
                 del self.state["sessions"][key]
+                self.state["promptVersions"].pop(key, None)
                 self.save()
             except Exception:
                 log.warning("muse temporary session cleanup failed: event=%s", event_id)
@@ -196,11 +206,14 @@ class MuseDispatch:
                         session_id = self.session_id(key)
                         prompt = self.context.prompt(record, record["packId"], playthrough_id, batch,
                                                      self.memory.view(record["packId"], playthrough_id,
-                                                                      record["route"]), mcp_call,
-                                                     rejected_batch=attempt.get("rejectedBatchId"))
+                                                                      record["route"]),
+                                                     self.state["promptVersions"].get(key) != self.context.version(),
+                                                     rejected_batch=attempt.get("rejectedBatchId"),
+                                                     rejected_reason=self.rejection_reason(attempt.get("rejectedBatchId")))
                         result = self.cli("send", prompt, "--thread", session_id, "--wait", str(MUSE_WAIT_SECONDS))
                         if result.get("sent") is not True:
                             raise MuseCliError("send", reason="not-sent")
+                        self.state["promptVersions"][key] = self.context.version()
                         reply_text = str((result.get("reply") or {}).get("text") or "")
                         attempt["replyText"] = reply_text[:4000]
                         self.save()
