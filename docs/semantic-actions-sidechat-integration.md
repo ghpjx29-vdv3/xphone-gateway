@@ -3,13 +3,13 @@
 ## 本轮改动
 
 - Gateway 首次唤醒一个固定旁聊时发送 `prompts/agent-turn.md` 的角色阅读与工具导览；后续事件只发本轮上下文，并在末尾加 `prompts/tool-hook.md`。OS 后台临时旁聊每次都是新会话，仍会收到完整导览。
-- Gateway 不再预读并注入 Worker 的 OS/角色 prompt、reference 正文或 16 种 action schema。旁聊按 `agent-turn.md` 的必读/选读要求，通过 Muse 内置 XPhone 连接器自己读取。
+- Gateway 连接 pack 时通过 MCP 拉取故事文档、角色 prompt 和 action schema，建立 `~/xphone/content/{packId}/` 文件树。旁聊按本轮给出的绝对路径从云电脑读取，不在每轮通过连接器重新拉文档。
 - Worker 的 `xphone.list_app_actions` 改为描述语义参数。Worker 仍只转发加密批次，不解析动作正文。
 - XPhone 客户端收到并解密 action 后，根据本轮事件、角色目录与当前状态补齐 Messages 的 `threadId/from`、新 action ID、笔记 ID/revision、世界状态 revision，以及部分地图/社媒目标。
 - **故事续写两阶段全链路打通（Phase 1 写作 + Phase 2 派工）**：
   - Phase 1：用户点击故事续写后，OS Agent 流式推流并独占提交 `journal.appendMainRecord`（关联 step 0 batchId），客户端保存正文后回执 `applied`。
-  - Phase 2：Gateway 拦截 Phase 1 完成状态，不立即终止事件，而是在同一 OS 旁聊中发起第二阶段派工（关联 step 1 batchId）；OS Agent 根据最新剧情规划角色联动，提交带 `sender` 的 `messages.append` 或社交/地图动作。
-  - 客户端 `semanticActionTargets.ts` 对 `journal.main_record` 在 step 0 applied 后保留事件并进入 step 1，支持按角色名/别名精准将 `sender` 绑定到角色线程，直接在手机端显示新消息。
+  - Phase 2：Gateway 拦截 Phase 1 完成状态，在同一 OS 旁聊中发起第二阶段。OS 根据最新剧情为每项 App 操作写本地任务文档，调用 `xphone.delegate_task` 只传文档绝对路径；对应 subagent 读取文档、提交动作。
+  - 客户端 `semanticActionTargets.ts` 对子批次核对 `parentEventId`、`step`、`targetApp` 和 `surfaceId`，再应用动作。
 
 ## 更新顺序
 
@@ -24,7 +24,7 @@
    sudo systemctl status xphone-gateway --no-pager
    ```
 
-4. Muse 旁聊中刷新 XPhone 连接器的工具说明，确认 `xphone.list_app_actions` 返回语义字段；角色 prompt 的读取继续走内置连接器已有能力。
+4. 确认云电脑 `prompts/app-actions.json` 已由 Gateway 缓存，旁聊读取本地角色 prompt 与动作清单；XPhone 连接器仍用于提交动作与传递任务路径。
 
 ## 三个立即可测的回合
 
@@ -48,15 +48,8 @@
 
 在 XPhone 故事 App（故事详情/阅读器）中发起一次续写请求（或通过 Bridge 派发 `journal.main_record.requested`）：
 1. **Phase 1（直接写作）**：OS Agent 旁聊被拉起，读取剧情设定后，调用 `xphone.submit_journal_stream_frame` 流式推流草稿，最后独占提交 `journal.appendMainRecord`（使用 `step 0` 的 `batchId`）。手机端打字机效果呈现并存入剧情数据库，返回 `applied` 回执。
-2. **Phase 2（角色派工）**：Gateway 检测到 Phase 1 正文已 `applied`，自动将该临时旁聊推入第二阶段（注入带 `step 1` `batchId` 的 `post_journal` 派工指令）。OS Agent 分析最新正文后，调用 `xphone.submit_action_batch` 提交语义 Action，例如：
-   ```json
-   {
-     "type": "messages.append",
-     "sender": "晚舟",
-     "text": "刚收到前线的报告，情况有些不对劲。你现在在什么位置？"
-   }
-   ```
-3. **客户端应用与呈现**：XPhone 客户端 `semanticActionTargets.ts` 在收到 step 1 batch 后，根据 `sender: "晚舟"` 自动查找角色目录，精准映射到 Wade 对应的 `threadId` 与角色显示名，完成入库并触发 `gigi:agent-message-applied` 事件。
+2. **Phase 2（角色交办）**：Gateway 检测到 Phase 1 正文已 `applied`，自动将该临时旁聊推入第二阶段。OS 在 `tasks/delegations/{eventId}/{uuid4}.md` 写三行任务（父事件、目标 App／页面、自然语言任务），调用 `xphone.delegate_task({"taskPath":"文档绝对路径"})`。Worker 只转发路径，网关唤醒 Messages subagent；subagent 打开文档并调用 `xphone.submit_action_batch`。
+3. **客户端应用与呈现**：XPhone 客户端 `semanticActionTargets.ts` 核对子批次的父事件和步骤，再把目标角色映射到对应 `threadId`，完成入库并触发 `gigi:agent-message-applied` 事件。
 4. **终态核验**：
    - 手机 Messages 列表中 Wade 的聊天窗口即时跳出晚舟发来的私信；
    - Worker 中两个 batchId（step 0 与 step 1）的 delivery 均更新为 `applied`；
@@ -66,7 +59,7 @@
 
 联调时记下 `eventId`、`batchId`、Muse sessionId、Gateway 日志时间和 Worker delivery 状态；不要记录密钥或私聊明文。若 delivery 为 `rejected`，客户端加密 receipt 已带拒收原因，Gateway 下一轮会把它放入 `previousRejectedReason`。Muse 侧如看不到该原因，先核对 `receipt.<batchId>` 是否已到 Gateway inbox。
 
-若旁聊能读故事文档但读不到角色 prompt，检查 **Muse 内置连接器的角色文档读取调用**。原始 Worker `/mcp` 的普通凭证与 Muse 内置连接器的应用能力不是同一份工具清单；不要仅凭 Worker 的 `tools/list` 推断 Muse 旁聊能力。
+若旁聊读不到角色 prompt，检查 `~/xphone/content/{packId}/prompts/` 是否已缓存相应文件，以及本轮 `localContent.rolePrompt` 是否指向它。
 
 ## 本轮边界
 

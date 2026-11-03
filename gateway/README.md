@@ -150,9 +150,26 @@ sudo systemctl restart xphone-gateway
 - `systemctl status xphone-gateway` 看状态；日志 `~/xphone/gateway/gateway.log`
 - **VM 会被替换**：`/etc` 是易失的，云主机替换后 systemd unit 会消失。配套 `watchdog.sh` + 定时任务（每 10 分钟）检查进程和最近成功拉取时间；异常时从 `xphone-gateway.service` 模板重装或重启。网关每次从服务端未确认队列的起点重扫，缺失的本地文件会重新生成。
 - **Muse 事件分发**：Gateway 按服务端 cursor 串行处理；OS 用户对话与角色私聊各有固定 side chat，OS 后台事件使用临时 side chat。映射、固定 batchId 与重试时间写在 `muse-dispatch.json`，共享摘要写在 `muse-memory.json`。失败按 30 秒起、最长 10 分钟退避；收到 `queued` 继续等待，只有客户端 `applied` 才确认事件。租约由独立线程每 30 秒续期，Hook 每 10 分钟检查一次作为故障兜底。
+- **云电脑内容树**：首次连接 pack 时，Gateway 从 MCP 拉取 manifest、全部故事文档、角色 prompt 与动作清单，在 `~/xphone/content/{packId}/` 建立 `docs/`、`prompts/` 和 `{playthroughId}/tasks/delegations/`、`{playthroughId}/memory/`。`prompts/` 包含 `tool-reminder.md`、`delegation-inject.md` 和 `app-actions.json`；`memory/` 初始化 `summary.md`、`pins.md`。后续旁聊按本轮给出的绝对路径直接读取这些文件。
+- **OS 交办 App 操作**：OS 在 `tasks/delegations/{eventId}/{uuid4}.md` 写父事件、目标 App／页面和自然语言任务，再调用 `xphone.delegate_task({"taskPath":"文档绝对路径"})`。Worker 只经现有 WS 转发路径；Gateway 读取文档并唤醒对应 subagent。接收确认不代表完成，客户端 `applied` 后摘要才写入 ledger；状态写在 `tasks/delegations/log.jsonl`。
 - **事件动作提交**：把动作数组写入 JSON 文件，调用 `submit_actions.py --pack-id <packId> --playthrough-id <playthroughId> --event-id <eventId> --step <固定步骤名> --actions-file <文件>`。同一事件重试时沿用步骤名；脚本先检查交付状态，再用稳定 ID 加密提交。
 - **worker 卡住告警**：`lease-stuck-monitor.sh` + 定时任务（每 30 分钟）。Gateway 按上面的退避规则重试，Hook 每 10 分钟兜底；若文件仍超过 30 分钟未完成，需要查看 Gateway 和 MCP 错误。监控只告警，不替处理者调用 `finish_event`。
 - 手动暂停维护：`touch ~/xphone/gateway/PAUSED`，watchdog 与卡住监控都会跳过
+
+### 个人代理定时维护
+
+`agent_maintenance.py` 通过 `muse-cli` 唤醒同一 pack/playthrough 的个人代理旁聊。体验检查每 30 分钟读本地 ledger 与角色文档，更新带过期时间的 `memory/health.md`；素材采集每天 3 次按 manifest 的 `inspirationCity` 搜索公开事件并更新 `memory/inspiration.md`；记忆整理每天 04:00 生成摘要修改提案，脚本在与 Gateway 共用的文件锁下备份并应用，仅替换摘要字段。网关下一轮把有效提醒注入 prompt。
+
+在 Muse VM 的运行时定时任务中加入以下三项（台北时间）：
+
+```cron
+CRON_TZ=Asia/Taipei
+*/30 * * * * HOME=/home/hatch /home/hatch/xphone/gateway/.venv/bin/python /home/hatch/xphone/gateway/agent_maintenance.py experience >> /home/hatch/xphone/gateway/maintenance.log 2>&1
+10 4,12,20 * * * HOME=/home/hatch /home/hatch/xphone/gateway/.venv/bin/python /home/hatch/xphone/gateway/agent_maintenance.py inspiration >> /home/hatch/xphone/gateway/maintenance.log 2>&1
+5 4 * * * HOME=/home/hatch /home/hatch/xphone/gateway/.venv/bin/python /home/hatch/xphone/gateway/agent_maintenance.py memory >> /home/hatch/xphone/gateway/maintenance.log 2>&1
+```
+
+定时任务要继承 Muse CLI 登录环境及出站代理。`agent_maintenance.py` 使用 `XPHONE_MUSE_CLI` 指定的 CLI 路径；未设置时使用 `/home/hatch/.local/bin/muse-cli`。
 
 ## 关键协议细节（实测所得）
 

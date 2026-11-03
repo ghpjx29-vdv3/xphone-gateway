@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from muse_context import MuseContext
+from muse_context import MuseContext, PROMPT_DIR
 from muse_delivery import batch_id
 from muse_dispatch import MuseDispatch
 
@@ -22,6 +22,12 @@ class MuseDispatchTests(unittest.TestCase):
         self.inbox = Path(self.tmp.name) / "inbox"
         self.inbox.mkdir()
         self.dispatcher = MuseDispatch(str(self.inbox), str(Path(self.tmp.name) / "state.json"))
+        self.dispatcher.context.cache.base = Path(self.tmp.name) / "content"
+        prompts = self.dispatcher.context.cache.root("pack") / "prompts"
+        prompts.mkdir(parents=True)
+        for source, target in (("tool-hook.md", "tool-reminder.md"),
+                               ("delegation-inject.md", "delegation-inject.md")):
+            (prompts / target).write_text((PROMPT_DIR / source).read_text(encoding="utf-8"), encoding="utf-8")
         self.event_id = "event-1"
         self.item = {"cursor": 1, "envelope": {"id": self.event_id, "kind": "event"}}
         self.record = {"id": self.event_id, "packId": "pack", "playthroughId": "play",
@@ -97,6 +103,7 @@ class MuseDispatchTests(unittest.TestCase):
 
     def test_subagent_followup_keeps_event_and_hook_without_role_prompt(self):
         context = MuseContext()
+        context.cache.base = self.dispatcher.context.cache.base
         first = context.prompt(self.record, "pack", "play", "batch", {}, True)
         followup = context.prompt(self.record, "pack", "play", "batch", {}, False)
         self.assertIn("connector_search", first)
@@ -105,9 +112,9 @@ class MuseDispatchTests(unittest.TestCase):
         self.assertIn("xphone.submit_action_batch", followup)
         self.assertNotIn("## P0 必读", followup)
         self.assertNotIn("threadId", followup)
-        self.assertLess(len(followup), len(first) * 0.3)
+        self.assertLess(len(followup), len(first))
 
-    def test_journal_orchestration_transitions_to_post_journal_and_dispatches_subagent(self):
+    def test_journal_orchestration_finishes_after_delegation_ack(self):
         journal_event_id = "journal-event-1"
         item = {"cursor": 2, "envelope": {"id": journal_event_id, "kind": "event"}}
         record = {
@@ -128,6 +135,8 @@ class MuseDispatchTests(unittest.TestCase):
                 return {"session_id": "os-session"}
             if args[0] == "send":
                 sent_prompts.append(args[1])
+                if len(sent_prompts) == 2:
+                    self.dispatcher.state["events"][journal_event_id]["delegations"] = ["/task.md"]
                 return {"sent": True, "reply": {"text": "正文完成" if len(sent_prompts) == 1 else "晚舟发了私信"}}
             if args[0] == "session-delete":
                 return {"ok": True}
@@ -148,8 +157,6 @@ class MuseDispatchTests(unittest.TestCase):
                 # Once send is invoked, mark batch as applied
                 if len(sent_prompts) >= 1 and bid == batch_0:
                     status_map[batch_0] = "applied"
-                if len(sent_prompts) >= 2 and bid == batch_1:
-                    status_map[batch_1] = "applied"
                 return result({"status": status_map.get(bid, "unknown")})
             return result({"ok": True})
 

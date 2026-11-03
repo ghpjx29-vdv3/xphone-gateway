@@ -256,25 +256,16 @@ class MuseDispatch:
                                 journal_summary=reply_text[:500]
                             )
                             result = self.cli("send", post_prompt, "--thread", sid, "--wait", str(MUSE_WAIT_SECONDS))
-                            if result.get("sent") is True:
-                                post_reply = str((result.get("reply") or {}).get("text") or "")
-                                if post_reply:
-                                    reply_text = f"{reply_text}\n\n[Post-Journal]: {post_reply}"
-                                attempt["replyText"] = reply_text[:4000]
-                                self.save()
+                            if result.get("sent") is not True:
+                                raise MuseCliError("send", reason="not-sent")
+                            post_reply = str((result.get("reply") or {}).get("text") or "")
+                            if post_reply:
+                                reply_text = f"{reply_text}\n\n[Post-Journal]: {post_reply}"
+                            attempt["replyText"] = reply_text[:4000]
+                            self.save()
                         post_status = delivery_status(mcp_call, post_batch)
-                        if post_status in ("queued", "pending"):
-                            post_status = self.wait_delivery(mcp_call, post_batch, cancel, renewal)
-                        elif post_status == "unknown":
-                            for _ in range(5):
-                                if renewal.lost or (cancel and cancel.is_set()):
-                                    break
-                                time.sleep(1)
-                                post_status = delivery_status(mcp_call, post_batch)
-                                if post_status != "unknown":
-                                    if post_status in ("queued", "pending"):
-                                        post_status = self.wait_delivery(mcp_call, post_batch, cancel, renewal)
-                                    break
+                        if not attempt.get("delegations") and (post_status != "unknown" or "无需联动" not in post_reply):
+                            raise RuntimeError("post-journal 必须调用 delegate_task 或明确回复无需联动")
                         if post_status == "applied":
                             batches_completed.append(post_batch)
                         elif post_status == "rejected":

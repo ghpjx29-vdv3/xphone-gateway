@@ -258,7 +258,8 @@ class Gateway:
         self.mcp_url = pack_session["mcpUrl"]
         self.scope = pack_session["scope"]
         if self.muse_dispatch:
-            await asyncio.to_thread(self.content_cache.sync, self.mcp_call, self.scope["packId"])
+            await asyncio.to_thread(self.content_cache.sync, self.mcp_call,
+                                    self.scope["packId"], self.scope["playthroughId"])
         self._record_scope(self.scope, self.mcp_url)
         session_expires_at = pack_session["expiresAt"]
         log.info("minting event stream ticket")
@@ -320,10 +321,11 @@ class Gateway:
                 elif mtype == "delegate-task" and self.delegation:
                     request_id = data.get("requestId")
                     try:
-                        result = await asyncio.to_thread(self.delegation.accept, data.get("taskFile", ""),
+                        result = await asyncio.to_thread(self.delegation.accept, data.get("taskPath", ""),
                                                          self.scope["packId"], self.scope["playthroughId"])
                         await ws.send_text(json.dumps({"type": "delegate-ack", "requestId": request_id,
-                                                       "ok": True, "batchId": result["batchId"]}))
+                                                       "ok": True, "targetApp": result["targetApp"],
+                                                       "batchId": result["batchId"]}))
                     except Exception as error:
                         log.error("delegation failed: request=%s error=%s\n%s",
                                   request_id, str(error), traceback.format_exc())

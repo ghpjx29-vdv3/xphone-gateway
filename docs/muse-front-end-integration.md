@@ -4,7 +4,7 @@
 
 ## 版本与安装
 
-先部署与本指南同一次提交的 Worker，再更新 Muse VM 的 Gateway。Gateway 使用 `/account/gateway-session` 获取短期会话；Muse 旁聊通过内置 XPhone 连接器读取角色文档并执行动作。
+先部署与本指南同一次提交的 Worker，再更新 Muse VM 的 Gateway。Gateway 使用 `/account/gateway-session` 获取短期会话并在连接时缓存故事文档；Muse 旁聊从云电脑本地文件读取角色资料，通过 XPhone 连接器执行动作。
 
 在 Muse VM 更新：
 
@@ -22,11 +22,11 @@ tail -n 80 gateway.log
 
 ## Muse 侧检查
 
-1. 普通 XPhone 连接器能找到提交 App action、发送角色消息所需工具，以及 `xphone.get_delivery`、`story.get_context`、`story.read_reference`。故事工具同时传本轮 `eventId` 和 route 中的 `consumer`。若连接器 schema 未显示 eventId，刷新连接器定义。
-2. 在 Muse 旁聊实际使用的连接器中核对角色文档读取工具；`xphone.finish_event` 是 Gateway 的事件管理动作，旁聊不用调用。
+1. 确认 Gateway 已在 `~/xphone/content/{packId}/` 建立 `docs/`、`prompts/` 与 `{playthroughId}/tasks/delegations/`、`{playthroughId}/memory/`。旁聊读取提示词给出的本地文件路径，连接器只用于提交 App action、查询交付状态与提交任务文档路径。
+2. 普通 XPhone 连接器应显示 `xphone.delegate_task({"taskPath":"绝对路径"})` 和动作提交工具；`xphone.finish_event` 是 Gateway 的事件管理动作，旁聊不用调用。
 3. 发一条 OS 用户消息。Gateway 日志应出现 `inbox write`、`muse session created`、`muse event completed`。Muse side chat 用本轮固定 batchId 提交加密 App action；客户端 `applied` 后，Gateway 才写入 `muse-memory.json` 并确认事件。
 4. 对同一角色连续发两条 Messages 消息，确认复用该角色旁聊；换另一个角色，确认进入另一旁聊。OS 后台事件使用临时旁聊，完成后删除。普通 OS 对话保持固定旁聊。
-5. 角色调用 `story.get_context({"eventId":"本轮事件 ID","consumer":"本轮 route.consumer"})` 后按需读取 `story.read_reference({"eventId":"本轮事件 ID","consumer":"本轮 route.consumer","referenceId":"索引中的 ID"})`；伪造 consumer 或读取不属于该 route 的 reference 应被拒绝。当前是 event route 级授权，共享连接器凭证不区分具体旁聊身份。
+5. OS 在本轮 `localContent.taskDirectory` 建立 `<uuid4>.md`，调用 `delegate_task` 只传绝对路径；检查 Worker WS 消息不含任务正文，subagent 从云电脑打开该文档后提交本轮 batch。当前共享连接器凭证不区分具体旁聊身份，角色边界还依赖提示词与本地可读路径。
 6. 在专用测试帐号连续创建 20 个临时旁聊，记录创建时延、速率限制、会话上限及侧边栏表现，完成后清理。若要改用固定 ops 会话，先在专用测试旁聊验证 CLI 发送 `/clear` 后下一条消息确实不继承旧上下文；UI 有 `/clear` 不等于 CLI 一定执行。
 
 ## 前端侧检查

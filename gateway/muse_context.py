@@ -22,17 +22,24 @@ class MuseContext:
     def version(self) -> str:
         return hashlib.sha256((PROMPT_DIR / "agent-turn.md").read_bytes()).hexdigest()
 
+    def template(self, record: dict, name: str) -> str:
+        path = self.cache.root(record["packId"]) / "prompts" / name
+        return path.read_text(encoding="utf-8").strip()
+
     def local_paths(self, record: dict, route: dict) -> dict:
         pack_id, playthrough_id = record["packId"], record["playthroughId"]
         root = self.cache.root(pack_id)
         memory = root / playthrough_id / "memory"
         return {
             "rolePrompt": self.cache.role_prompt(pack_id, route),
+            "actionCatalog": str(root / "prompts" / "app-actions.json"),
+            "toolReminder": str(root / "prompts" / "tool-reminder.md"),
+            "delegationInject": str(root / "prompts" / "delegation-inject.md"),
             "readableDocuments": self.cache.allowed_paths(
                 pack_id, route, record["decrypted"].get("grantedReferenceIds") or []),
             "summary": str(memory / "summary.md"),
             "pins": str(memory / "pins.md"),
-            "taskPendingDirectory": str(root / playthrough_id / "tasks" / "pending"),
+            "taskDirectory": str(root / playthrough_id / "tasks" / "delegations" / record["id"]),
         }
 
     def timed_note(self, record: dict, name: str) -> str:
@@ -90,8 +97,10 @@ class MuseContext:
             parts.append((PROMPT_DIR / "agent-turn.md").read_text(encoding="utf-8").strip())
         if event.get("type") == "journal.main_record.requested":
             parts.append("【故事续写直接写作阶段 (Phase 1)】\n请调用 `xphone.submit_journal_stream_frame` 流式输出草稿，并在最后调用 `xphone.submit_action_batch` 独占提交 `journal.appendMainRecord`（batchId 必须为此轮上下文中的 batchId）。此阶段请勿提交其他角色私聊或动作；正文落盘后将进入 Phase 2 角色联动编排。")
+        if route["role"] == "os-agent":
+            parts.append(f"需要其他 App 执行具体操作时，在云电脑目录 {current['localContent']['taskDirectory']} 写一份 <uuid4>.md 任务文档；调用 xphone.delegate_task 时只填该文档的绝对路径。工具返回的是接收确认，执行结果下轮从 ledger 读取。")
         parts.append("当前事件与共享上下文：" + json.dumps(current, ensure_ascii=False, separators=(",", ":")))
-        parts.append((PROMPT_DIR / "tool-hook.md").read_text(encoding="utf-8").strip())
+        parts.append(self.template(record, "tool-reminder.md"))
         health = self.timed_note(record, "health.md")
         if health:
             parts.append("[架构健康提醒]\n" + health)
@@ -120,10 +129,10 @@ class MuseContext:
         parts = [
             "【故事正文已落盘，进入续写后角色与世界联动阶段 (Phase 2: Post-Journal Orchestration)】",
             f"故事正文已保存。当前角色列表：{json.dumps(actors, ensure_ascii=False)}",
-            "请根据最新剧情进展规划联动。每项 App 动作各写一份本地任务文件，再用 `xphone.delegate_task` 只提交文件名。不得由 OS 直接提交私聊、地图、社媒、笔记或世界动作。",
+            f"请根据最新剧情进展规划联动。每项 App 动作都在云电脑目录 {current['localContent']['taskDirectory']} 写一份 <uuid4>.md 任务文档，再用 xphone.delegate_task 只提交该文档的绝对路径。不得由 OS 直接提交私聊、地图、社媒、笔记或世界动作。",
             "如无需联动：直接回复“无需联动”。",
             "当前上下文与批次：" + json.dumps(current, ensure_ascii=False, separators=(",", ":")),
-            (PROMPT_DIR / "tool-hook.md").read_text(encoding="utf-8").strip(),
+            self.template(record, "tool-reminder.md"),
         ]
         health = self.timed_note(record, "health.md")
         if health:
@@ -134,12 +143,12 @@ class MuseContext:
         return "\n\n".join(parts)
 
     def delegated_prompt(self, record: dict, route: dict, batch: str, step: int,
-                         task_file: str, task: str, memory: dict, first_turn: bool) -> str:
+                         task_path: str, memory: dict, first_turn: bool) -> str:
         delegated = {**record, "route": route}
         current = {
             "packId": record["packId"], "playthroughId": record["playthroughId"],
             "parentEventId": record["id"], "eventId": record["id"],
-            "step": step, "batchId": batch, "taskFile": task_file,
+            "step": step, "batchId": batch, "taskPath": task_path,
             "role": "subagent", "targetApp": route["targetApp"],
             "surfaceId": route["surfaceId"], "consumer": route["consumer"],
             "localContent": self.local_paths(delegated, route), "sharedMemory": memory,
@@ -147,10 +156,12 @@ class MuseContext:
         parts = []
         if first_turn:
             parts.append((PROMPT_DIR / "agent-turn.md").read_text(encoding="utf-8").strip())
-        parts.extend(["OS 派工任务。只执行目标 App／页面，不替 OS 规划其他 App。提交加密 action batch 时，在批次内容写入 parentEventId、step、targetApp、surfaceId，值照抄下方上下文，客户端用它们关联父事件。",
-                      "任务正文：" + task,
+        local = current["localContent"]
+        documents = "\n".join(local["readableDocuments"]) or "本轮没有已解锁的故事文档"
+        parts.extend([self.template(record, "delegation-inject.md"),
+                      f"现在先用云电脑文件读取能力打开任务文档：{task_path}\n再读角色说明：{local['rolePrompt']}\n动作清单：{local['actionCatalog']}\n可读故事文档：\n{documents}",
                       "当前事件与共享上下文：" + json.dumps(current, ensure_ascii=False, separators=(",", ":")),
-                      (PROMPT_DIR / "tool-hook.md").read_text(encoding="utf-8").strip()])
+                      self.template(record, "tool-reminder.md")])
         health = self.timed_note(record, "health.md")
         if health:
             parts.append("[架构健康提醒]\n" + health)
