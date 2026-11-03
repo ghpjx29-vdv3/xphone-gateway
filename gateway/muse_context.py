@@ -59,7 +59,7 @@ class MuseContext:
         event = record["decrypted"]
         route = record["route"]
         payload = event.get("payload") or {}
-        user_input = {key: payload[key] for key in ("text", "requestKind", "platform", "action", "item", "location")
+        user_input = {key: payload[key] for key in ("prompt", "text", "requestKind", "platform", "action", "item", "location")
                       if key in payload}
         current = {
             "packId": pack_id, "playthroughId": playthrough_id,
@@ -113,12 +113,15 @@ class MuseContext:
     def post_journal_prompt(self, record: dict, pack_id: str, playthrough_id: str,
                             batch_id: str, memory: dict, journal_summary: str = "") -> str:
         event = record["decrypted"]
+        payload = event.get("payload") or {}
+        user_prompt = payload.get("prompt") or payload.get("text") or ""
         actors = [actor["name"] for actor in event.get("actors", [])]
         current = {
             "packId": pack_id, "playthroughId": playthrough_id,
             "eventId": record["id"], "batchId": batch_id,
             "role": "os-agent", "stage": "post_journal_orchestration",
             "type": "journal.post_orchestration",
+            "userPrompt": user_prompt,
             "actors": actors,
             "notes": [note["title"] for note in event.get("notes", [])],
             "sharedMemory": memory,
@@ -128,12 +131,16 @@ class MuseContext:
             current["journalSummary"] = journal_summary[:500]
         parts = [
             "【故事正文已落盘，进入续写后角色与世界联动阶段 (Phase 2: Post-Journal Orchestration)】",
+        ]
+        if user_prompt:
+            parts.append(f"【用户对本轮故事的联动与交办指示】\n{user_prompt}")
+        parts.extend([
             f"故事正文已保存。当前角色列表：{json.dumps(actors, ensure_ascii=False)}",
-            f"请根据最新剧情进展规划联动。每项 App 动作都在云电脑目录 {current['localContent']['taskDirectory']} 写一份 <uuid4>.md 任务文档，再用 xphone.delegate_task 只提交该文档的绝对路径。不得由 OS 直接提交私聊、地图、社媒、笔记或世界动作。",
+            f"请根据最新剧情进展与用户的交办指示规划联动。每项 App 动作都在云电脑目录 {current['localContent']['taskDirectory']} 写一份 <uuid4>.md 任务文档，再用 xphone.delegate_task 只提交该文档的绝对路径。不得由 OS 直接提交私聊、地图、社媒、笔记或世界动作。",
             "如无需联动：直接回复“无需联动”。",
             "当前上下文与批次：" + json.dumps(current, ensure_ascii=False, separators=(",", ":")),
             self.template(record, "tool-reminder.md"),
-        ]
+        ])
         health = self.timed_note(record, "health.md")
         if health:
             parts.append("[架构健康提醒]\n" + health)

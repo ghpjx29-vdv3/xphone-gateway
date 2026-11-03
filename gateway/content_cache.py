@@ -99,6 +99,9 @@ class ContentCache:
         consumers = {consumer}
         if consumer.startswith("messages."):
             consumers.add("messages")
+            suffix = consumer.removeprefix("messages.").replace("_", "-").split(":")[0]
+            consumers.add(f"messages.{suffix}")
+            consumers.add(f"characters.{suffix}")
         granted = set(granted_ids)
         return [str(self.document_path(pack_id, item["id"]))
                 for item in manifest["documents"]
