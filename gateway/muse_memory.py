@@ -13,11 +13,16 @@ class MuseMemory:
     def view(self, pack_id: str, playthrough_id: str, route: dict) -> dict:
         scope = self.data.get(f"{pack_id}:{playthrough_id}", {})
         surface = route.get("surfaceId")
+        raw_ledger = scope.get("ledger", [])
+        clean_ledger = [
+            {"surfaceId": item.get("surfaceId") or "system", "summary": item["summary"], "source": item.get("source")}
+            for item in raw_ledger if item.get("summary") and item["summary"].strip()
+        ]
         if route.get("role") == "os-agent":
             return {"surfaces": dict(list(scope.get("surfaces", {}).items())[-12:]),
-                    "ledger": scope.get("ledger", [])[-12:]}
+                    "ledger": clean_ledger[-12:]}
         return {"surface": scope.get("surfaces", {}).get(surface),
-                "ledger": [item for item in scope.get("ledger", []) if item.get("surfaceId") == surface][-5:]}
+                "ledger": [item for item in clean_ledger if item.get("surfaceId") == surface][-5:]}
 
     def commit(self, pack_id: str, playthrough_id: str, event_id: str, route: dict,
                batch_ids: list[str], summary: str, source: str) -> None:

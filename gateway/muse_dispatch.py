@@ -6,6 +6,7 @@ import os
 import subprocess
 import threading
 import time
+import traceback
 from pathlib import Path
 
 from muse_context import MuseContext, tool_data
@@ -293,6 +294,6 @@ class MuseDispatch:
                 delay = min(30 * 2 ** min(failures - 1, 5), 600)
                 attempt.update({"failures": failures, "nextAt": time.time() + delay})
                 self.save()
-                log.warning("muse dispatch deferred: event=%s reason=%s retry_in=%ss",
-                            event_id, type(error).__name__, delay)
+                log.warning("muse dispatch deferred: event=%s reason=%s error=%s retry_in=%ss\n%s",
+                            event_id, type(error).__name__, str(error), delay, traceback.format_exc())
                 return

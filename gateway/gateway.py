@@ -320,7 +320,7 @@ class Gateway:
                 except Exception as error:
                     log.warning("account key transfer poll failed: %s", type(error).__name__)
                 try:
-                    await asyncio.wait_for(self._stop.wait(), timeout=5)
+                    await asyncio.wait_for(self._stop.wait(), timeout=15)
                 except asyncio.TimeoutError:
                     pass
 
