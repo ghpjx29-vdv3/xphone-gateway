@@ -107,6 +107,60 @@ class MuseDispatchTests(unittest.TestCase):
         self.assertNotIn("threadId", followup)
         self.assertLess(len(followup), len(first) * 0.3)
 
+    def test_journal_orchestration_transitions_to_post_journal_and_dispatches_subagent(self):
+        journal_event_id = "journal-event-1"
+        item = {"cursor": 2, "envelope": {"id": journal_event_id, "kind": "event"}}
+        record = {
+            "id": journal_event_id, "packId": "pack", "playthroughId": "play",
+            "route": {"role": "os-agent", "roleId": "osAgent:main", "consumer": "os",
+                      "targetApp": "g5_dashboard", "surfaceId": "journal.main_record"},
+            "decrypted": {"type": "journal.main_record.requested", "payload": {},
+                          "actors": [{"name": "晚舟", "actorId": "wan_zhou:role"}]}
+        }
+        (self.inbox / f"{journal_event_id}.json").write_text(json.dumps(record), encoding="utf-8")
+
+        sent_prompts = []
+        batch_0 = batch_id("pack", "play", journal_event_id, 0)
+        batch_1 = batch_id("pack", "play", journal_event_id, 1)
+
+        def cli(*args):
+            if args[0] == "session-start":
+                return {"session_id": "os-session"}
+            if args[0] == "send":
+                sent_prompts.append(args[1])
+                return {"sent": True, "reply": {"text": "正文完成" if len(sent_prompts) == 1 else "晚舟发了私信"}}
+            if args[0] == "session-delete":
+                return {"ok": True}
+            raise AssertionError(args)
+
+        self.dispatcher.cli = cli
+
+        status_map = {batch_0: "unknown", batch_1: "unknown"}
+
+        def mcp(name, args):
+            self.calls.append((name, args))
+            if name == "xphone.get_event_status":
+                return result({"status": "accepted"})
+            if name == "xphone.start_event":
+                return result({"status": "running", "claimed": True, "leaseId": "lease"})
+            if name == "xphone.get_delivery":
+                bid = args["batchId"]
+                # Once send is invoked, mark batch as applied
+                if len(sent_prompts) >= 1 and bid == batch_0:
+                    status_map[batch_0] = "applied"
+                if len(sent_prompts) >= 2 and bid == batch_1:
+                    status_map[batch_1] = "applied"
+                return result({"status": status_map.get(bid, "unknown")})
+            return result({"ok": True})
+
+        self.dispatcher.dispatch([item], mcp, "play", pack_id="pack")
+        self.assertEqual(len(sent_prompts), 2)
+        self.assertIn("Phase 1", sent_prompts[0])
+        self.assertIn("Phase 2", sent_prompts[1])
+        finish_calls = [args for name, args in self.calls if name == "xphone.finish_event"]
+        self.assertEqual(len(finish_calls), 1)
+        self.assertEqual(finish_calls[0]["status"], "completed")
+
 
 if __name__ == "__main__":
     unittest.main()

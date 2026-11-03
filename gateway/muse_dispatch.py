@@ -228,6 +228,50 @@ class MuseDispatch:
                         raise RuntimeError(f"delivery {current}")
                     if renewal.lost or (cancel and cancel.is_set()):
                         raise RuntimeError("lease or scope lost")
+
+                    batches_completed = [batch]
+                    is_journal = (event_type == "journal.main_record.requested" or
+                                  record.get("route", {}).get("surfaceId") == "journal.main_record")
+                    if is_journal and step == 0:
+                        post_step = 1
+                        post_batch = batch_id(record["packId"], playthrough_id, event_id, post_step)
+                        attempt.update({"step": post_step, "batchId": post_batch})
+                        self.save()
+                        post_status = delivery_status(mcp_call, post_batch)
+                        if post_status == "unknown":
+                            sid = session_id or self.session_id(key)
+                            post_prompt = self.context.post_journal_prompt(
+                                record, record["packId"], playthrough_id, post_batch,
+                                self.memory.view(record["packId"], playthrough_id, record["route"]),
+                                journal_summary=reply_text[:500]
+                            )
+                            result = self.cli("send", post_prompt, "--thread", sid, "--wait", str(MUSE_WAIT_SECONDS))
+                            if result.get("sent") is True:
+                                post_reply = str((result.get("reply") or {}).get("text") or "")
+                                if post_reply:
+                                    reply_text = f"{reply_text}\n\n[Post-Journal]: {post_reply}"
+                                attempt["replyText"] = reply_text[:4000]
+                                self.save()
+                        post_status = delivery_status(mcp_call, post_batch)
+                        if post_status in ("queued", "pending"):
+                            post_status = self.wait_delivery(mcp_call, post_batch, cancel, renewal)
+                        elif post_status == "unknown":
+                            for _ in range(5):
+                                if renewal.lost or (cancel and cancel.is_set()):
+                                    break
+                                time.sleep(1)
+                                post_status = delivery_status(mcp_call, post_batch)
+                                if post_status != "unknown":
+                                    if post_status in ("queued", "pending"):
+                                        post_status = self.wait_delivery(mcp_call, post_batch, cancel, renewal)
+                                    break
+                        if post_status == "applied":
+                            batches_completed.append(post_batch)
+                        elif post_status == "rejected":
+                            attempt.update({"step": post_step + 1, "rejectedBatchId": post_batch})
+                            self.save()
+                            raise RuntimeError("post-journal delivery rejected")
+
                     if not reply_text:
                         try:
                             sid = session_id or self.state["sessions"].get(key)
@@ -241,7 +285,7 @@ class MuseDispatch:
                         except Exception as err:
                             log.warning("muse history fallback failed: %s", err)
                     source = "reply_text" if reply_text else "delivery_only"
-                    self.finish(item, record, mcp_call, lease_id, [batch], reply_text,
+                    self.finish(item, record, mcp_call, lease_id, batches_completed, reply_text,
                                 source, key, temporary)
                     continue
             except Exception as error:

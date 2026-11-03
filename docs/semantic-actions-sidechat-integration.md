@@ -6,6 +6,10 @@
 - Gateway 不再预读并注入 Worker 的 OS/角色 prompt、reference 正文或 16 种 action schema。旁聊按 `agent-turn.md` 的必读/选读要求，通过 Muse 内置 XPhone 连接器自己读取。
 - Worker 的 `xphone.list_app_actions` 改为描述语义参数。Worker 仍只转发加密批次，不解析动作正文。
 - XPhone 客户端收到并解密 action 后，根据本轮事件、角色目录与当前状态补齐 Messages 的 `threadId/from`、新 action ID、笔记 ID/revision、世界状态 revision，以及部分地图/社媒目标。
+- **故事续写两阶段全链路打通（Phase 1 写作 + Phase 2 派工）**：
+  - Phase 1：用户点击故事续写后，OS Agent 流式推流并独占提交 `journal.appendMainRecord`（关联 step 0 batchId），客户端保存正文后回执 `applied`。
+  - Phase 2：Gateway 拦截 Phase 1 完成状态，不立即终止事件，而是在同一 OS 旁聊中发起第二阶段派工（关联 step 1 batchId）；OS Agent 根据最新剧情规划角色联动，提交带 `sender` 的 `messages.append` 或社交/地图动作。
+  - 客户端 `semanticActionTargets.ts` 对 `journal.main_record` 在 step 0 applied 后保留事件并进入 step 1，支持按角色名/别名精准将 `sender` 绑定到角色线程，直接在手机端显示新消息。
 
 ## 更新顺序
 
@@ -39,6 +43,24 @@
 ### 3. OS 与其他动作
 
 在 OS 对话发送请求，确认首次能按原有 OS prompt 读取世界观、时间线和人物资料，之后按需查询；连续对话仍能提交 `agent.reply`。笔记更新可以用笔记标题指代目标，由客户端填 `noteId/baseRevision`；世界状态更新由客户端填 `expectedStateRevision`。地图地点名称只在客户端现有地图目录可找到该地点时解析；社媒评论可用本轮帖子作为目标。找不到或目标不唯一时应拒绝并反馈，不让模型猜 ID。
+
+### 4. 故事续写与 OS Agent 派工角色联动（核心新链路）
+
+在 XPhone 故事 App（故事详情/阅读器）中发起一次续写请求（或通过 Bridge 派发 `journal.main_record.requested`）：
+1. **Phase 1（直接写作）**：OS Agent 旁聊被拉起，读取剧情设定后，调用 `xphone.submit_journal_stream_frame` 流式推流草稿，最后独占提交 `journal.appendMainRecord`（使用 `step 0` 的 `batchId`）。手机端打字机效果呈现并存入剧情数据库，返回 `applied` 回执。
+2. **Phase 2（角色派工）**：Gateway 检测到 Phase 1 正文已 `applied`，自动将该临时旁聊推入第二阶段（注入带 `step 1` `batchId` 的 `post_journal` 派工指令）。OS Agent 分析最新正文后，调用 `xphone.submit_action_batch` 提交语义 Action，例如：
+   ```json
+   {
+     "type": "messages.append",
+     "sender": "晚舟",
+     "text": "刚收到前线的报告，情况有些不对劲。你现在在什么位置？"
+   }
+   ```
+3. **客户端应用与呈现**：XPhone 客户端 `semanticActionTargets.ts` 在收到 step 1 batch 后，根据 `sender: "晚舟"` 自动查找角色目录，精准映射到 Wade 对应的 `threadId` 与角色显示名，完成入库并触发 `gigi:agent-message-applied` 事件。
+4. **终态核验**：
+   - 手机 Messages 列表中 Wade 的聊天窗口即时跳出晚舟发来的私信；
+   - Worker 中两个 batchId（step 0 与 step 1）的 delivery 均更新为 `applied`；
+   - Gateway 日志中打印出包含两个批次的 `muse event completed: event=... batches=['...', '...']`，临时旁聊自动清理。
 
 ## 排查记录
 

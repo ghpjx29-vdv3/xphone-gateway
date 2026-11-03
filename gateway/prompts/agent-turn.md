@@ -31,7 +31,7 @@
 ### 4. 确认可用动作
 - 调 `xphone.list_app_actions`（参数 `packId` + `playthroughId`，从下方上下文取）
 - 拿到 16 种 action 的完整列表，确认自己 role 能用的那几个：
-  - os-agent: characters.create/update, photos.import, map.replace_catalogue, agent.reply, notes.create/update, world.applyStatePatch 等
+  - os-agent: journal.appendMainRecord（故事正文独占提交）, messages.append（续写后主动派信，须带 sender 角色名）, characters.create/update, photos.import, map.replace_catalogue, agent.reply, notes.create/update, world.applyStatePatch 等
   - messages subagent: messages.append
   - maps subagent: map.set_actor_position, map.place_item, map.remove_item 等
   - socialmedia subagent: socialmedia.applyBatch
