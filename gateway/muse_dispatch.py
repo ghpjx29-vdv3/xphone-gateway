@@ -62,6 +62,7 @@ class LeaseRenewal:
 class MuseDispatch:
     def __init__(self, inbox: str, state_path: str):
         self.inbox, self.state_path = Path(inbox), Path(state_path)
+        self.state_lock = threading.RLock()
         self.state = json.loads(self.state_path.read_text(encoding="utf-8")) if self.state_path.exists() else {
             "sessions": {}, "events": {},
         }
@@ -70,10 +71,11 @@ class MuseDispatch:
         self.state.setdefault("promptVersions", {})
 
     def save(self) -> None:
-        self.state_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.state_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self.state, ensure_ascii=False), encoding="utf-8")
-        os.replace(tmp, self.state_path)
+        with self.state_lock:
+            self.state_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.state_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self.state, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, self.state_path)
 
     def cli(self, *args: str) -> dict:
         env = os.environ.copy()
@@ -103,13 +105,14 @@ class MuseDispatch:
         return f"{scope}:{route['roleId']}", False
 
     def session_id(self, key: str) -> str:
-        sessions = self.state["sessions"]
-        if key not in sessions:
-            result = self.cli("session-start", "--title", f"XPhone {key}")
-            sessions[key] = result.get("session_id") or result["id"]
-            self.save()
-            log.info("muse session created: key=%s", key)
-        return sessions[key]
+        with self.state_lock:
+            sessions = self.state["sessions"]
+            if key not in sessions:
+                result = self.cli("session-start", "--title", f"XPhone {key}")
+                sessions[key] = result.get("session_id") or result["id"]
+                self.save()
+                log.info("muse session created: key=%s", key)
+            return sessions[key]
 
     def rejection_reason(self, batch: str | None) -> str | None:
         if not batch:
@@ -220,6 +223,12 @@ class MuseDispatch:
                         self.save()
                     else:
                         reply_text = attempt.get("replyText", "")
+                    if record["route"]["role"] == "os-agent":
+                        current = delivery_status(mcp_call, batch)
+                        if current == "unknown" and (attempt.get("delegations") or "无需联动" in reply_text):
+                            self.finish(item, record, mcp_call, lease_id, [], reply_text,
+                                        "reply_text" if reply_text else "delegation_only", key, temporary)
+                            continue
                     current = self.wait_delivery(mcp_call, batch, cancel, renewal)
                     if current == "rejected":
                         attempt.update({"step": step + 1, "rejectedBatchId": batch})

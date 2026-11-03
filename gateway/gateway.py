@@ -26,12 +26,15 @@ import signal
 import sys
 import threading
 import time
+import traceback
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from wsclient import WSClient, WSClientError
 from account_api import active_scope, session, mcp_call as account_mcp_call
 from key_transfer import respond_to_pending
 from muse_dispatch import MuseDispatch
+from content_cache import ContentCache
+from delegation import Delegation
 
 HOME = os.path.expanduser("~")
 BASE = os.path.join(HOME, "xphone")
@@ -66,6 +69,9 @@ class Gateway:
         os.makedirs(INBOX, exist_ok=True)
         self.muse_dispatch = (MuseDispatch(INBOX, os.path.join(BASE, "gateway", "muse-dispatch.json"))
                               if PROVIDER == "muse" else None)
+        self.content_cache = ContentCache()
+        self.delegation = Delegation(self.muse_dispatch, self.content_cache.base) if self.muse_dispatch else None
+        self._delegation_poll_lock = threading.Lock()
         self._dispatch_lock = threading.Lock()
         self._dispatch_cancel = threading.Event()
         self._dispatch_pending = False
@@ -197,6 +203,19 @@ class Gateway:
             if new_cursor <= cursor:
                 break
             cursor = new_cursor
+        if self.delegation and self.scope and self._delegation_poll_lock.acquire(blocking=False):
+            token, url, scope = self.session_token, self.mcp_url, self.scope.copy()
+
+            def poll_delegations() -> None:
+                try:
+                    self.delegation.poll(lambda name, args: account_mcp_call(name, args, token, url),
+                                         scope["packId"], scope["playthroughId"])
+                except Exception:
+                    log.error("delegation tracking failed\n%s", traceback.format_exc())
+                finally:
+                    self._delegation_poll_lock.release()
+
+            threading.Thread(target=poll_delegations, daemon=True).start()
         if PROVIDER == "muse" and self.muse_dispatch and self.scope and retained:
             if not self._dispatch_lock.acquire(blocking=False):
                 self._dispatch_pending = True
@@ -238,6 +257,8 @@ class Gateway:
         self.session_token = pack_session["token"]
         self.mcp_url = pack_session["mcpUrl"]
         self.scope = pack_session["scope"]
+        if self.muse_dispatch:
+            await asyncio.to_thread(self.content_cache.sync, self.mcp_call, self.scope["packId"])
         self._record_scope(self.scope, self.mcp_url)
         session_expires_at = pack_session["expiresAt"]
         log.info("minting event stream ticket")
@@ -261,7 +282,6 @@ class Gateway:
         # {"type":"ready"}, and the spec says to pull after notification/reconnect.
         try:
             await asyncio.to_thread(self.pull_inbox)
-            last_pull = time.monotonic()
             awaiting_pong = False
             while not self._stop.is_set():
                 if int(time.time() * 1000) + 60_000 >= session_expires_at or await asyncio.to_thread(active_scope) != self.scope:
@@ -275,9 +295,6 @@ class Gateway:
                         raise WSClientError("websocket pong timeout")
                     await ws.send_text("ping")
                     awaiting_pong = True
-                    if time.monotonic() - last_pull >= POLL_INTERVAL:
-                        await asyncio.to_thread(self.pull_inbox)
-                        last_pull = time.monotonic()
                     continue
                 if msg is None:
                     log.info("server closed connection")
@@ -293,16 +310,25 @@ class Gateway:
                 if mtype == "ready":
                     log.info("received ready; pulling inbox")
                     await asyncio.to_thread(self.pull_inbox)
-                    last_pull = time.monotonic()
                 elif mtype == "envelope":
                     log.info("envelope notification cursor=%s",
                              data.get("cursor"))
                     await asyncio.to_thread(self.pull_inbox)
-                    last_pull = time.monotonic()
                 elif mtype in ("event-finished", "inbox-acked"):
                     log.info("queue progress notification type=%s", mtype)
                     await asyncio.to_thread(self.pull_inbox)
-                    last_pull = time.monotonic()
+                elif mtype == "delegate-task" and self.delegation:
+                    request_id = data.get("requestId")
+                    try:
+                        result = await asyncio.to_thread(self.delegation.accept, data.get("taskFile", ""),
+                                                         self.scope["packId"], self.scope["playthroughId"])
+                        await ws.send_text(json.dumps({"type": "delegate-ack", "requestId": request_id,
+                                                       "ok": True, "batchId": result["batchId"]}))
+                    except Exception as error:
+                        log.error("delegation failed: request=%s error=%s\n%s",
+                                  request_id, str(error), traceback.format_exc())
+                        await ws.send_text(json.dumps({"type": "delegate-ack", "requestId": request_id,
+                                                       "ok": False, "error": str(error)}, ensure_ascii=False))
                 else:
                     log.debug("unhandled message type: %s", mtype)
         finally:

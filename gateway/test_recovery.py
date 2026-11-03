@@ -49,6 +49,10 @@ class RetainedInboxTests(unittest.TestCase):
         self.gateway._dispatch_lock = threading.Lock()
         self.gateway._dispatch_cancel = threading.Event()
         self.gateway._dispatch_pending = False
+        self.gateway._delegation_poll_lock = threading.Lock()
+        self.gateway.delegation = None
+        self.gateway.muse_dispatch = None
+        self.gateway.scope = None
 
     def test_deleted_unacked_file_is_restored_on_next_pull(self):
         calls = []

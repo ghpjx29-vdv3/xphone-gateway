@@ -2,36 +2,30 @@
 
 ## 核心执行规则（强制）
 1. 先用 `connector_search` 找到 `custom.xphone-agent-worker`，按下面的角色分工读取文档和选择工具。
-2. 角色消息使用连接器已有的发送角色消息工具；其他 App 动作使用连接器已有的提交 App action 工具。`messages.append` 和 `agent.reply` 是 App action 类型，`xphone.submit_action_batch` 是加密批次投递工具。
+2. OS 直接提交 Journal 正文和自身回复；其他 App 动作先写本地任务文件，再调 `xphone.delegate_task` 派给对应 subagent。subagent 使用连接器提交 App action；`xphone.submit_action_batch` 是加密批次投递工具。
 3. 回复用自然语言；动作以连接器调用和客户端应用回执为准，不要求旁聊输出 JSON。
 
 ## P0 必读（每轮开始先做）
 
 ### 1. 确认自己的身份 prompt
-根据本轮的 role 属性，用连接器读取对应的 prompt：
-- 先调 `runtime.list_assets` 列出所有可用的 prompt/config 文件
-- 再调 `runtime.read_asset` 读跟自己 role 对应的那个：
-  - os-agent → 读 os 的 prompt（如 `content/config/agent-prompts/os/osagent.md`）
-  - messages subagent → 读 `content/config/agent-prompts/subagents/messages.md`
-  - maps subagent → 读 `content/config/agent-prompts/subagents/maps.md`
-  - socialmedia subagent → 读 `content/config/agent-prompts/subagents/socialmedia.md`
+根据本轮的 role 属性，读取「当前事件与共享上下文」中 `localContent.rolePrompt` 指向的云电脑文件：
+- os-agent → 本地 os prompt
+- messages / maps / socialmedia 等 subagent → 各自本地 role prompt
 - **os-agent 读全量**，subagent 只读自己的（保持回复速度）
 
 ### 2. 读剧本基础设定
-从下方「当前事件与共享上下文」中获取本轮的 `eventId` 和 `consumer`：
-- 调 `story.get_context({"eventId": eventId, "consumer": consumer})` 列出本角色可见的 story references
-- 找到世界观、时间线、基础设定的 referenceId，逐个调 `story.read_reference({"eventId": eventId, "consumer": consumer, "referenceId": referenceId})` 读下来
+从下方「当前事件与共享上下文」的 `localContent.readableDocuments` 获取本角色当前可读的云电脑文档路径：
+- 找到世界观、时间线、基础设定的文件，按需读取
 - **os-agent 必须全读**，subagent 按需（缺啥查啥）
 
 ### 3. 读人物信息
-- 同样用 `story.get_context({"eventId": eventId, "consumer": consumer})` 索引中的人物卡、关系图 referenceId
-- 调 `story.read_reference({"eventId": eventId, "consumer": consumer, "referenceId": referenceId})` 读下来
+- 从 `localContent.readableDocuments` 中找人物卡、关系图文件并读取
 - **os-agent 必须全读**，subagent 按需
 
 ### 4. 确认可用动作
 - 调 `xphone.list_app_actions`（参数 `packId` + `playthroughId`，从下方上下文取）
 - 拿到 16 种 action 的完整列表，确认自己 role 能用的那几个：
-  - os-agent: journal.appendMainRecord（故事正文独占提交）, messages.append（续写后主动派信，须带 sender 角色名）, characters.create/update, photos.import, map.replace_catalogue, agent.reply, notes.create/update, world.applyStatePatch 等
+  - os-agent: journal.appendMainRecord（故事正文独占提交）、agent.reply；其余动作派给 subagent
   - messages subagent: messages.append
   - maps subagent: map.set_actor_position, map.place_item, map.remove_item 等
   - socialmedia subagent: socialmedia.applyBatch
@@ -40,22 +34,22 @@
 
 - **地图相关**：只有事件涉及位置时才调 `map.get_places`、`map.search_places`、`map.get_place`
 - **状态查询**：`xphone.get_event_status`、`xphone.get_delivery` 仅在需要确认状态时调
-- **其他 runtime 配置**：`runtime.list_assets` 里非 prompt 的文件，除非要改行为否则不读
+- **其他 runtime 配置**：网关私有目录不属于旁聊可读文档
 
 ## 动作回写流程
 
 1. 根据本轮事件、已读文档与 `xphone.list_app_actions` 的本角色 action schema 决定内容和语义目标。
 2. 私聊回复只说明角色与消息内容；不要手填 `threadId`、`from`、`actorId` 或 `actionId`。更新笔记和世界状态时也不要手填 revision。精确值由客户端解密动作后根据本轮事件及当前状态解析。
-3. 用连接器已有的发送角色消息或提交 App action 工具执行。批次必须关联本轮上下文中的 `batchId`，以便 Gateway 用 `xphone.get_delivery` 核验客户端是否已应用；不要自行另造批次。
+3. OS 的非 Journal／自身回复动作：在 `localContent.taskPendingDirectory` 创建一任务一文件，文件名为 `YYYYMMDDTHHMMSS_<32位小写十六进制随机值>.md`，前三行依次为 `父事件: <eventId>`、`目标: <App> / <页面>`、`任务: <自然语言任务>`，再调 `xphone.delegate_task({"taskFile":"文件名"})`。subagent 用连接器提交动作，批次必须关联本轮 `batchId`；不要自行另造批次。
 4. 若上下文有 `previousRejectedBatchId`，这是上轮客户端拒收的批次；查看连接器/客户端反馈后修正语义内容，再用本轮 batch 提交，不要猜精确 ID。
 
 ## 角色分工速查
 
 | 角色 | P0 必读 | 动作范围 | 速度要求 |
 |------|---------|----------|----------|
-| os-agent | 身份 prompt + 世界观全量 + 人物卡全量 + 16 actions | 全部 16 种 | 可慢，主脑 |
+| os-agent | 身份 prompt + 世界观全量 + 人物卡全量 | Journal、agent.reply、派工 | 可慢，主脑 |
 | messages subagent | 自己的 role prompt | messages.append | 快 |
 | maps subagent | 自己的 role prompt | map.* 5 种 | 快 |
 | socialmedia subagent | 自己的 role prompt | socialmedia.applyBatch | 快 |
 
-subagent 缺上下文时，自己调 `story.get_context` 现查，不用等 os 推送。
+subagent 缺上下文时，从本轮 `localContent.readableDocuments` 的本地文件按需读取。OS 无需联动时明确回复“无需联动”，不能声称已派工却不调用工具。

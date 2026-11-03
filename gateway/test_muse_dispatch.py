@@ -101,7 +101,7 @@ class MuseDispatchTests(unittest.TestCase):
         followup = context.prompt(self.record, "pack", "play", "batch", {}, False)
         self.assertIn("connector_search", first)
         self.assertIn("当前事件与共享上下文", followup)
-        self.assertIn("story.get_context", followup)
+        self.assertIn("readableDocuments", followup)
         self.assertIn("xphone.submit_action_batch", followup)
         self.assertNotIn("## P0 必读", followup)
         self.assertNotIn("threadId", followup)
