@@ -271,7 +271,7 @@ class MuseDispatch:
                     step = attempt.get("step", 0)
                     batch = batch_id(record["packId"], playthrough_id, event_id, step)
                     attempt.update({"playthroughId": playthrough_id, "packId": record["packId"],
-                                    "batchId": batch, "sessionKey": key})
+                                    "batchId": batch, "sessionKey": key, "step": step})
                     self.save()
                     current = delivery_status(mcp_call, batch)
                     if current == "rejected":

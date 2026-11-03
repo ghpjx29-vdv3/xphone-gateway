@@ -172,8 +172,9 @@ class Delegation:
             parent = json.loads(parent_path.read_text(encoding="utf-8"))
             if parent["packId"] != pack_id or parent["playthroughId"] != playthrough_id:
                 raise ValueError("事件不属于当前游玩")
-            batch = attempt["batchId"]
-            step, route = attempt["step"], parent["route"]
+            step = attempt.get("step", 0)
+            batch = attempt.get("batchId") or batch_id(pack_id, playthrough_id, event_id, step)
+            route = parent.get("route") or {}
             origin = "event"
         action_path = path.with_suffix(".actions.json")
         if not action_path.exists():
