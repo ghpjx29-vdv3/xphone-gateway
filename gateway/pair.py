@@ -41,8 +41,12 @@ def main() -> None:
     public = private_key.public_key().public_numbers()
     encode = lambda integer: base64.urlsafe_b64encode(integer.to_bytes(32, "big")).rstrip(b"=").decode()
     started = request("/pair/start", {"publicKey": {"kty": "EC", "crv": "P-256",
-                                                    "x": encode(public.x), "y": encode(public.y)}})
-    print(f"XPhone pairing code: {started['code']} (expires in 5 minutes)", flush=True)
+                                                    "x": encode(public.x), "y": encode(public.y)},
+                                      "provider": "muse"})
+    print("\n" + "=" * 52, flush=True)
+    print(f"XPhone 8 位配对码: {started['code']} (有效期 5 分钟)", flush=True)
+    print("请在 GIGI 手机前端的「个人代理配对」页输入该配对码并确认授权。", flush=True)
+    print("=" * 52 + "\n", flush=True)
     while time.time() * 1000 < started["expiresAt"]:
         try:
             result = request("/pair/redeem", {"code": started["code"], "secret": started["secret"]})
@@ -56,11 +60,14 @@ def main() -> None:
             continue
         bundle = result["bundle"]
         config = os.path.join(os.path.expanduser("~"), ".config", "xphone")
-        write_secret(os.path.join(config, "content.key"), unwrap(private_key, bundle["key"]))
-        write_secret(TOKEN_PATH, unwrap(private_key, bundle["token"]))
-        print("XPhone paired. Credentials stored with mode 0600.", flush=True)
+        content_key = unwrap(private_key, bundle["key"])
+        token = unwrap(private_key, bundle["token"])
+        write_secret(os.path.join(config, "content.key"), content_key)
+        write_secret(TOKEN_PATH, token)
+        print("配对成功！凭证已安全保存到 ~/.config/xphone/ (权限 0600)。", flush=True)
+        print(f"\n个人令牌 (若 Muse 平台连接器需手动填 API Key):\n{token}\n", flush=True)
         return
-    raise TimeoutError("XPhone pairing code expired")
+    raise TimeoutError("XPhone 配对超时，配对码已失效，请重新运行。")
 
 
 if __name__ == "__main__":

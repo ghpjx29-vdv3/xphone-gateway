@@ -41,24 +41,18 @@ batch 的 delivery→applied，或检测该用户 agent WS 在线）。
    通读本 README。
 2. **装依赖**：把仓库的 `gateway/` 内容同步到 `~/xphone/gateway/`，再在目标目录执行 `python3 -m venv .venv && .venv/bin/pip install cryptography`。Muse provider 还需在 VM 安装并登录 `muse-cli`。
    （Python 3.10+；加解密必须用该 venv 的 python，系统 python 没有 cryptography）。
-3. **向用户索要两样东西**（告诉用户去 XPhone 前端「个人代理」页一键复制）：
-   - 个人令牌（Bearer，用于 MCP 鉴权）
-   - 内容密钥（base64url，32 字节）
-
-   在用户给出之前**不要编造、不要跳过**。
-4. **写内容密钥**：`mkdir -p ~/.config/xphone && chmod 700 ~/.config/xphone`；
-   密钥写入 `~/.config/xphone/content.key`，`chmod 600`。只放这里，不进仓库、不进日志、
-   不在对话里复述。
+3. **配对换取凭证（统一 8 位配对码）**：
+   在目标目录执行 `.venv/bin/python pair.py`。
+   终端将输出 8 位配对码（例如 `3EY64LSN`，有效期 5 分钟）。
+   代理将该 8 位配对码告诉用户，让用户在 XPhone / GIGI 手机前端的「个人代理」页输入并点击确认配对。
+4. **自动落盘凭证**：
+   用户在前端确认后，`pair.py` 自动从 `/pair/redeem` 完成兑换并用本地私钥解密，将凭证写入：
+   - `~/.config/xphone/content.key`（内容解密密钥，chmod 600）
+   - `~/.config/xphone/account.token`（账号 Bearer 令牌，chmod 600）
+   用户和代理全程无需手工复制粘贴长密钥。
 5. **配置 MCP 客户端（connector）**：
-   - **推荐路径（Muse 用户）**：XPhone 可向 Meta 的 Muse Connector Platform
-    （muse.ai/platform）提交 directory connector，类型选 "Existing MCP"，
-     填 Worker 的 `/mcp` 地址。过审后用户在 Muse 连接器目录里一点即连，
-     免去手动配置，本步可跳过。
-   - **通用路径（其他平台 / 未过审期间）**：把 `https://<worker>/mcp`
-     加为你所在 agent 平台的 MCP server，鉴权 `Authorization: Bearer <个人令牌>`。
-
-   网关使用个人令牌通过 `/account/gateway-session` 取得自己的短期凭证；side chat 使用普通连接器凭证提交动作。两种凭证的工具权限不同。
-   令牌走平台的安全密钥机制（如 Secure Vault），**绝不写进仓库任何文件、绝不明文落盘**。
+   - **推荐路径（Muse VM 本地连接器）**：VM 本地连接器脚本直接从 `~/.config/xphone/account.token` 读取 Bearer Token（或由 Gateway `/account/gateway-session` 派发），无需手动配 API Key。
+   - **平台路径（第三方平台 / Muse 平台手工添加）**：若平台连接器配置表单必须填入 API Key，使用 `pair.py` 成功输出中打印的 `accountToken` 填入 `Authorization: Bearer <accountToken>` 即可。
 6. **起常驻网关**：先用 `sudo env HOME=/home/hatch wss_proxy="${https_proxy:-${HTTPS_PROXY:-}}" "$(command -v muse-cli)" status` 确认服务所用的 HOME 和 Muse CLI 可连接，再从 `~/xphone/gateway/` 执行 `sudo cp xphone-gateway.service /etc/systemd/system/ &&
    sudo systemctl daemon-reload && sudo systemctl enable --now xphone-gateway`
    （已安装则为重装+重启）。服务模板选择 Muse provider；如需出站代理，先配好 `proxy.env`。若 systemd 找不到 CLI，在该文件写入 `XPHONE_MUSE_CLI=/绝对路径/muse-cli`。将 Hook 脚本同步到 `~/hooks/scripts/xphone-inbox.sh`，并通过 Muse 的 Hook 管理工具把已注册 Hook 的 `poll_interval_secs` 更新为 600；只复制 JSON 文件不会更新已注册配置。
@@ -75,11 +69,9 @@ batch 的 delivery→applied，或检测该用户 agent WS 在线）。
     失败则明确说卡在哪一步、原始错误是什么、需要用户提供什么。
     **绝不编造"成功"，不确定就说不确定。**
 
-### 更新令牌/密钥
+### 重新配对/更换代理
 
-用户给出新的令牌/密钥时：按步骤 4、5 替换内容密钥与令牌，
-`sudo systemctl restart xphone-gateway`，重做步骤 8、9 验证。不用重做全套。
-
+需要更换密钥或重置存档时：在 VM 重新运行 `.venv/bin/python pair.py`，让用户在前端确认配对码；完成后执行 `sudo systemctl restart xphone-gateway` 并复核验证。
 ### 执行中必须遵守
 
 严格遵守「关键协议细节」第 1-8 条，尤其是：
@@ -90,8 +82,7 @@ batch 的 delivery→applied，或检测该用户 agent WS 在线）。
 ## 前置条件
 
 - Python 3.10+，`pip install cryptography`
-- XPhone 个人代理令牌（Bearer，用于 MCP 鉴权）
-- 内容密钥（32 字节，base64url，0600 文件存放）
+- 运行 `pair.py` 通过 8 位配对码在 XPhone / GIGI 前端完成配对
 - 出站网络（本项目在需要 HTTP 代理的环境测试通过，见下方代理说明）
 
 ## 安装
