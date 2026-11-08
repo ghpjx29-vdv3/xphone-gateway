@@ -11,6 +11,7 @@ from cryptography.hazmat.primitives.asymmetric import ec, ed25519
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from account_api import account_token, request
+from key_store import read_key
 
 
 PUBLIC_KEY_PATH = Path(__file__).with_name("key_transfer_public.pem")
@@ -56,13 +57,13 @@ def seal_key(content_key: bytes, claims: dict) -> dict:
             "nonce": encode(nonce), "ciphertext": encode(ciphertext)}
 
 
-def respond_to_pending(content_key: bytes) -> int:
+def respond_to_pending() -> int:
     token = account_token()
     requests = request("/account/key-transfer/pending", {}, token)["requests"]
     sent = 0
     for item in requests:
         claims = verify_ticket(item["ticket"], account_id(token))
-        envelope = seal_key(content_key, claims)
+        envelope = seal_key(read_key(claims["scope"]), claims)
         request("/account/key-transfer/respond", {"requestId": claims["requestId"], "envelope": envelope}, token)
         sent += 1
     return sent

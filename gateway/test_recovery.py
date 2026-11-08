@@ -128,7 +128,8 @@ class RetainedInboxTests(unittest.TestCase):
             "content": [{"text": json.dumps({"ticket": "ticket", "connection": "connection"})}]
         }
         self.gateway.pull_inbox = lambda: None
-        with patch.object(gateway_module, "WSClient", return_value=socket), patch.object(
+        with patch.object(gateway_module, "read_key", return_value=b"a" * 32), patch.object(
+            gateway_module, "WSClient", return_value=socket), patch.object(
             gateway_module, "PING_INTERVAL", 0.01
         ), patch.object(gateway_module, "active_scope", return_value={"packId": "pack"}) as scope_check, patch.object(
             gateway_module, "session", return_value={"token": "token", "mcpUrl": "https://worker.example/mcp",
@@ -138,7 +139,7 @@ class RetainedInboxTests(unittest.TestCase):
                 asyncio.run(self.gateway.run_once())
         self.assertEqual(socket.sent, ["ping"])
         self.assertTrue(socket.closed)
-        self.assertEqual(scope_check.call_count, 1)
+        self.assertEqual(scope_check.call_count, 2)
 
     def test_call_mcp_tool_invocation_and_session_caching(self):
         fake_sess = {

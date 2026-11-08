@@ -47,7 +47,7 @@ batch 的 delivery→applied，或检测该用户 agent WS 在线）。
    代理将该 8 位配对码告诉用户，让用户在 XPhone / GIGI 手机前端的「个人代理」页输入并点击确认配对。
 4. **自动落盘凭证**：
    用户在前端确认后，`pair.py` 自动从 `/pair/redeem` 完成兑换并用本地私钥解密，将凭证写入：
-   - `~/.config/xphone/content.key`（内容解密密钥，chmod 600）
+    - `~/.config/xphone/content-keys/` 下当前存档的内容解密密钥（chmod 600）
    - `~/.config/xphone/account.token`（账号 Bearer 令牌，chmod 600）
    用户和代理全程无需手工复制粘贴长密钥。
 5. **配置 MCP 客户端（connector）**：
@@ -94,10 +94,8 @@ cp -a ~/xphone-gateway/gateway/. ~/xphone/gateway/
 cd ~/xphone/gateway
 python3 -m venv .venv && .venv/bin/pip install cryptography
 
-# 1. 放内容密钥（0600，其他人不可读）
-mkdir -p ~/.config/xphone && chmod 700 ~/.config/xphone
-# 把 43 字符 base64url 密钥写入 ~/.config/xphone/content.key
-chmod 600 ~/.config/xphone/content.key
+# 1. 按上面的 8 位配对码流程运行 pair.py，自动保存当前存档的密钥
+.venv/bin/python pair.py
 
 # 2. 放代理配置（如需出站代理；不需要则留空文件）
 cp proxy.env.example proxy.env  # 按环境填写 https_proxy 等
@@ -129,7 +127,7 @@ sudo systemctl restart xphone-gateway
 
 | 项 | 位置 | 说明 |
 |---|---|---|
-| 内容密钥 | `~/.config/xphone/content.key` | base64url 32 字节，0600。网关启动读一次进内存 |
+| 内容密钥 | `~/.config/xphone/content-keys/` | 按 packId/playthroughId 索引的 base64url 32 字节密钥，0600；网关切换存档时加载 |
 | 代理 | `gateway/proxy.env` | `https_proxy`/`wss_proxy` 等，0600。Muse WSS 优先使用 `wss_proxy`，未设置时沿用 HTTPS 代理 |
 | provider | systemd 服务 / `proxy.env` | 服务模板设为 `muse`；其他个人代理可在 `proxy.env` 设 `XPHONE_PROVIDER=worker` 使用现有 worker 路径 |
 | Muse CLI | Muse VM | 登录凭证只保存在该 VM；`XPHONE_MUSE_CLI` 可指定可执行文件的绝对路径，不传给公共 Worker 或写入日志 |

@@ -6,11 +6,11 @@ Loop:
   2. Mint a one-time ticket via MCP xphone.open_event_stream.
   3. Connect to the agent WebSocket with subprotocol xphone-agent-ticket.<ticket>.
   4. On envelope notifications, pull events via MCP xphone.read_inbox.
-  5. Decrypt each envelope (AES-256-GCM, content key read once at startup).
+  5. Decrypt each envelope with the active playthrough's AES-256-GCM key.
   6. Write one JSON file per event to ~/xphone/inbox/<event-id>.json.
   7. The selected provider handles the retained event; Muse uses muse-cli.
 
-Secrets: the content key is read once from ~/.config/xphone/content.key (0600)
+Secrets: the active playthrough's content key is read from 0600 scoped storage
 into memory. The account token is read by account_api from Secure Vault or a
 0600 local file; pack session tokens stay in memory. Nothing secret is
 logged: logs carry event ids, cursors and routes only, never key material,
@@ -32,6 +32,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from wsclient import WSClient, WSClientError
 from account_api import active_scope, session, mcp_call as account_mcp_call
 from key_transfer import respond_to_pending
+from key_store import read_key
 from muse_dispatch import MuseDispatch
 from content_cache import ContentCache
 from delegation import Delegation
@@ -41,7 +42,6 @@ BASE = os.path.join(HOME, "xphone")
 INBOX = os.path.join(BASE, "inbox")
 HEALTH_PATH = os.path.join(BASE, "gateway", "health.json")
 SCOPE_PATH = os.path.join(BASE, "gateway", "scope.json")
-KEY_PATH = os.path.join(HOME, ".config", "xphone", "content.key")
 USER_AGENT = "XPhone-Gateway/1.0"
 PROVIDER = os.environ.get("XPHONE_PROVIDER", "worker")
 
@@ -58,14 +58,8 @@ def b64u_decode(s: str) -> bytes:
 
 class Gateway:
     def __init__(self) -> None:
-        with open(KEY_PATH) as f:
-            key_b64 = f.read().strip()
-        self.key = b64u_decode(key_b64)
-        if len(self.key) != 32:
-            raise RuntimeError("content key is not 32 bytes")
-        self.aesgcm = AESGCM(self.key)
-        # Drop the base64 text; keep only key bytes in memory.
-        del key_b64
+        self.key = None
+        self.aesgcm = None
         os.makedirs(INBOX, exist_ok=True)
         self.muse_dispatch = (MuseDispatch(INBOX, os.path.join(BASE, "gateway", "muse-dispatch.json"))
                               if PROVIDER == "muse" else None)
@@ -254,6 +248,8 @@ class Gateway:
                 pass
             return
         pack_session = await asyncio.to_thread(session)
+        self.key = await asyncio.to_thread(read_key, pack_session["scope"], pack_session.get("sourceScope"))
+        self.aesgcm = AESGCM(self.key)
         self.session_token = pack_session["token"]
         self.mcp_url = pack_session["mcpUrl"]
         self.scope = pack_session["scope"]
@@ -294,6 +290,11 @@ class Gateway:
                 except asyncio.TimeoutError:
                     if awaiting_pong:
                         raise WSClientError("websocket pong timeout")
+                    current_scope = await asyncio.to_thread(active_scope)
+                    if not current_scope or any(current_scope.get(key) != self.scope.get(key)
+                                                for key in ("packId", "playthroughId")):
+                        log.info("active scope changed; reconnecting")
+                        break
                     await ws.send_text("ping")
                     awaiting_pong = True
                     if self.muse_dispatch and any(
@@ -366,7 +367,7 @@ class Gateway:
         async def serve_key_transfers() -> None:
             while not self._stop.is_set():
                 try:
-                    count = await asyncio.to_thread(respond_to_pending, self.key)
+                    count = await asyncio.to_thread(respond_to_pending)
                     if count:
                         log.info("sent %d encrypted account key transfer(s)", count)
                 except Exception as error:

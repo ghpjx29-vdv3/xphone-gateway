@@ -10,6 +10,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from account_api import TOKEN_PATH, request
+from key_store import write_key
 
 
 def decode(value: str) -> bytes:
@@ -59,10 +60,9 @@ def main() -> None:
             time.sleep(2)
             continue
         bundle = result["bundle"]
-        config = os.path.join(os.path.expanduser("~"), ".config", "xphone")
         content_key = unwrap(private_key, bundle["key"])
         token = unwrap(private_key, bundle["token"])
-        write_secret(os.path.join(config, "content.key"), content_key)
+        write_key(bundle["scope"], content_key)
         write_secret(TOKEN_PATH, token)
         print("配对成功！凭证已安全保存到 ~/.config/xphone/ (权限 0600)。", flush=True)
         print(f"\n个人令牌 (若 Muse 平台连接器需手动填 API Key):\n{token}\n", flush=True)
