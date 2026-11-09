@@ -25,6 +25,25 @@ def memory_lock(path: Path):
                 fcntl.flock(lock_file, fcntl.LOCK_UN)
 
 
+SURFACE_NAMES = {
+    "agent": "个人代理", "os": "个人代理", "journal": "故事正文", "messages": "私聊",
+    "maps": "地图", "socialmedia": "社交动态", "notes": "备忘录",
+    "world": "世界", "characters": "人物", "photos": "相册", "system": "系统",
+}
+
+
+def surface_label(raw: str | None) -> str:
+    if not raw:
+        return "系统"
+    parts = raw.split(".")
+    base = parts[0]
+    name = SURFACE_NAMES.get(base, base)
+    if base == "messages" and len(parts) >= 3 and parts[1] == "dm":
+        actor = parts[2].split(":")[0]
+        return f"{name}（{actor}）"
+    return name
+
+
 class MuseMemory:
     def __init__(self, path: str):
         self.path = Path(path)
@@ -36,16 +55,34 @@ class MuseMemory:
         scope = self.read().get(f"{pack_id}:{playthrough_id}", {})
         surface = route.get("surfaceId")
         raw_ledger = scope.get("ledger", [])
-        clean_ledger = [
-            {"surfaceId": item.get("surfaceId") or "system", "summary": item["summary"],
-             "source": item.get("source"), "status": item.get("status", "applied")}
-            for item in raw_ledger if item.get("summary") and item["summary"].strip()
-        ]
+        seen = set()
+        clean_ledger = []
+        for item in reversed(raw_ledger):
+            summary = str(item.get("summary") or "").strip()
+            raw_surface = item.get("surfaceId") or "system"
+            label = surface_label(raw_surface)
+            key = (label, summary)
+            if not any(character.isalnum() for character in summary) or key in seen:
+                continue
+            seen.add(key)
+            clean_ledger.append({"surfaceId": label, "summary": summary,
+                                 "source": item.get("source"), "status": item.get("status", "applied"),
+                                 "createdAt": item.get("createdAt"),
+                                 "_rawSurface": raw_surface})
+        clean_ledger.reverse()
+        raw_surfaces = {name: summary for name, summary in scope.get("surfaces", {}).items()
+                        if any(character.isalnum() for character in str(summary))}
+        surfaces = {surface_label(name): summary for name, summary in raw_surfaces.items()}
         if route.get("role") == "os-agent":
-            return {"surfaces": dict(list(scope.get("surfaces", {}).items())[-12:]),
-                    "ledger": clean_ledger[-12:]}
-        return {"surface": scope.get("surfaces", {}).get(surface),
-                "ledger": [item for item in clean_ledger if item.get("surfaceId") == surface][-5:]}
+            return {"surfaces": dict(list(surfaces.items())[-6:]),
+                    "ledger": [{k: v for k, v in entry.items() if not k.startswith("_")}
+                               for entry in clean_ledger[-6:]]}
+        target_summary = raw_surfaces.get(surface) or surfaces.get(surface_label(surface))
+        subagent_ledger = [{k: v for k, v in entry.items() if not k.startswith("_")}
+                           for entry in clean_ledger
+                           if entry.get("_rawSurface") == surface or entry.get("surfaceId") == surface_label(surface)][-5:]
+        return {"surface": target_summary,
+                "ledger": subagent_ledger}
 
     def commit(self, pack_id: str, playthrough_id: str, event_id: str, route: dict,
                batch_ids: list[str], summary: str, source: str,

@@ -42,6 +42,7 @@ BASE = os.path.join(HOME, "xphone")
 INBOX = os.path.join(BASE, "inbox")
 HEALTH_PATH = os.path.join(BASE, "gateway", "health.json")
 SCOPE_PATH = os.path.join(BASE, "gateway", "scope.json")
+CORRUPTED_PATH = os.path.join(BASE, "gateway", "corrupted-events.jsonl")
 USER_AGENT = "XPhone-Gateway/1.0"
 PROVIDER = os.environ.get("XPHONE_PROVIDER", "worker")
 
@@ -66,10 +67,28 @@ class Gateway:
         self.content_cache = ContentCache()
         self.delegation = Delegation(self.muse_dispatch, self.content_cache.base) if self.muse_dispatch else None
         self._delegation_poll_lock = threading.Lock()
-        self._dispatch_lock = threading.Lock()
-        self._dispatch_cancel = threading.Event()
-        self._dispatch_pending = False
+        self._dispatch_locks: dict[str, threading.Lock] = {}
+        self._dispatch_lock_guard = threading.Lock()
+        self._dispatch_cancel: list[threading.Event] = []
+        self._dispatch_pending: set[str] = set()
+        self._corrupted_events: set[str] = set()
         self._stop = asyncio.Event()
+
+    def _record_corrupted(self, event_id: str, cursor: int, error: Exception, envelope: dict) -> None:
+        if event_id in self._corrupted_events:
+            return
+        self._corrupted_events.add(event_id)
+        os.makedirs(os.path.dirname(CORRUPTED_PATH), exist_ok=True)
+        record = {
+            "eventId": event_id,
+            "cursor": cursor,
+            "error": str(error) or type(error).__name__,
+            "errorType": type(error).__name__,
+            "timestamp": int(time.time() * 1000),
+            "kind": envelope.get("kind"),
+        }
+        with open(CORRUPTED_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     def _record_health(self) -> None:
         os.makedirs(os.path.dirname(HEALTH_PATH), exist_ok=True)
@@ -116,9 +135,10 @@ class Gateway:
             try:
                 decrypted = self.decrypt_envelope(envelope)
             except Exception as error:
-                log.error("decrypt blocked: event=%s cursor=%s error=%s",
+                log.error("decrypt blocked: event=%s cursor=%s error=%s (skipping and recording)",
                           event_id, cursor, type(error).__name__)
-                raise
+                self._record_corrupted(event_id, cursor, error, envelope)
+                continue
             aad = json.loads(b64u_decode(envelope["aad"]).decode("utf-8"))
             record = {
                 "id": event_id,
@@ -211,29 +231,46 @@ class Gateway:
 
             threading.Thread(target=poll_delegations, daemon=True).start()
         if PROVIDER == "muse" and self.muse_dispatch and self.scope and retained:
-            if not self._dispatch_lock.acquire(blocking=False):
-                self._dispatch_pending = True
-                return
             token, url, scope = self.session_token, self.mcp_url, self.scope.copy()
-            cancel = threading.Event()
-            self._dispatch_cancel = cancel
-            self._dispatch_pending = False
+            grouped: dict[str, list] = {}
+            for item in retained:
+                path = os.path.join(INBOX, f"{item['envelope']['id']}.json")
+                if not os.path.exists(path):
+                    continue
+                with open(path, encoding="utf-8") as f:
+                    record = json.load(f)
+                key = (self.muse_dispatch.session_key(record)[0]
+                       if item["envelope"]["kind"] == "event" else f"receipt:{record['id']}")
+                grouped.setdefault(key, []).append(item)
+            for key, items in grouped.items():
+                with self._dispatch_lock_guard:
+                    lock = self._dispatch_locks.setdefault(key, threading.Lock())
+                    if not lock.acquire(blocking=False):
+                        self._dispatch_pending.add(key)
+                        continue
+                    cancel = threading.Event()
+                    self._dispatch_cancel.append(cancel)
+                    self._dispatch_pending.discard(key)
 
-            def dispatch_retained() -> None:
-                try:
-                    self.muse_dispatch.dispatch(
-                        retained,
-                        lambda name, args: account_mcp_call(name, args, token, url),
-                        scope["playthroughId"], pack_id=scope["packId"], cancel=cancel,
-                    )
-                except Exception as error:
-                    log.warning("muse dispatch deferred: error=%s", type(error).__name__)
-                finally:
-                    self._dispatch_lock.release()
-                    if self._dispatch_pending and not cancel.is_set():
-                        self.pull_inbox()
+                def dispatch_retained(role_key=key, role_items=items, role_lock=lock, role_cancel=cancel) -> None:
+                    try:
+                        self.muse_dispatch.dispatch(
+                            role_items,
+                            lambda name, args: account_mcp_call(name, args, token, url),
+                            scope["playthroughId"], pack_id=scope["packId"], cancel=role_cancel,
+                        )
+                    except Exception as error:
+                        log.warning("muse dispatch deferred: error=%s", type(error).__name__)
+                    finally:
+                        role_lock.release()
+                        with self._dispatch_lock_guard:
+                            if role_cancel in self._dispatch_cancel:
+                                self._dispatch_cancel.remove(role_cancel)
+                            should_pull = role_key in self._dispatch_pending and not role_cancel.is_set()
+                        if should_pull:
+                            self.pull_inbox()
 
-            threading.Thread(target=dispatch_retained, daemon=True).start()
+                threading.Thread(target=dispatch_retained, daemon=True).start()
         self._record_health()
 
     async def run_once(self) -> None:
@@ -290,13 +327,17 @@ class Gateway:
                 except asyncio.TimeoutError:
                     if awaiting_pong:
                         raise WSClientError("websocket pong timeout")
-                    current_scope = await asyncio.to_thread(active_scope)
-                    if not current_scope or any(current_scope.get(key) != self.scope.get(key)
-                                                for key in ("packId", "playthroughId")):
-                        log.info("active scope changed; reconnecting")
-                        break
+                    try:
+                        current_scope = await asyncio.to_thread(active_scope)
+                        if not current_scope or any(current_scope.get(key) != self.scope.get(key)
+                                                    for key in ("packId", "playthroughId")):
+                            log.info("active scope changed; reconnecting")
+                            break
+                    except Exception as scope_err:
+                        log.warning("active scope check failed: %s", scope_err)
                     await ws.send_text("ping")
                     awaiting_pong = True
+                    self._record_health()
                     if self.muse_dispatch and any(
                         attempt.get("nextAt") and attempt["nextAt"] <= time.time()
                         for attempt in self.muse_dispatch.state["events"].values()
@@ -360,7 +401,10 @@ class Gateway:
                     log.debug("unhandled message type: %s", mtype)
         finally:
             if PROVIDER == "muse":
-                self._dispatch_cancel.set()
+                with self._dispatch_lock_guard:
+                    cancels = list(self._dispatch_cancel)
+                for cancel in cancels:
+                    cancel.set()
             await ws.close()
 
     async def run(self) -> None:

@@ -29,9 +29,8 @@ Gateway 常驻在 Muse VM，主动连上 XPhone Worker 的 Agent WS。Worker 先
 
 > 帮我部署 github.com/ghpjx29-vdv3/xphone-gateway 并连接 xphone
 
-个人代理读完本节后全自动完成下面所有步骤。**前端配合**：个人代理页提供「个人令牌」
-与「内容密钥」两个一键复制按钮；检测到连通后自动显示「已连接」（建议轮询冒泡测试
-batch 的 delivery→applied，或检测该用户 agent WS 在线）。
+个人代理读完本节后全自动完成下面所有步骤。前端「个人代理」页输入 8 位配对码；
+凭证由配对程序安全接收并保存，不需要手动复制令牌或内容密钥。
 
 ### 个人代理执行清单
 
@@ -52,7 +51,7 @@ batch 的 delivery→applied，或检测该用户 agent WS 在线）。
    用户和代理全程无需手工复制粘贴长密钥。
 5. **配置 MCP 客户端（connector）**：
    - **推荐路径（Muse VM 本地连接器）**：VM 本地连接器脚本直接从 `~/.config/xphone/account.token` 读取 Bearer Token（或由 Gateway `/account/gateway-session` 派发），无需手动配 API Key。
-   - **平台路径（第三方平台 / Muse 平台手工添加）**：若平台连接器配置表单必须填入 API Key，使用 `pair.py` 成功输出中打印的 `accountToken` 填入 `Authorization: Bearer <accountToken>` 即可。
+   - **平台路径（第三方平台 / Muse 平台连接器）**：平台 OAuth2 可用时，按照平台显示的授权码在 XPhone「个人代理」页授权已配对的存档。Muse 平台 OAuth2 暂不可用时，用户在配对页选中 Muse 存档并点击「复制 MCP API Key」，自行粘贴到 Muse 连接器的 API key 输入框。
 6. **起常驻网关**：先用 `sudo env HOME=/home/hatch wss_proxy="${https_proxy:-${HTTPS_PROXY:-}}" "$(command -v muse-cli)" status` 确认服务所用的 HOME 和 Muse CLI 可连接，再从 `~/xphone/gateway/` 执行 `sudo cp xphone-gateway.service /etc/systemd/system/ &&
    sudo systemctl daemon-reload && sudo systemctl enable --now xphone-gateway`
    （已安装则为重装+重启）。服务模板选择 Muse provider；如需出站代理，先配好 `proxy.env`。若 systemd 找不到 CLI，在该文件写入 `XPHONE_MUSE_CLI=/绝对路径/muse-cli`。将 Hook 脚本同步到 `~/hooks/scripts/xphone-inbox.sh`，并通过 Muse 的 Hook 管理工具把已注册 Hook 的 `poll_interval_secs` 更新为 600；只复制 JSON 文件不会更新已注册配置。

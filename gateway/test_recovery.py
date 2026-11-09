@@ -37,17 +37,24 @@ class RetainedInboxTests(unittest.TestCase):
             gateway_module, "HEALTH_PATH", os.path.join(self.tmp.name, "health.json"))
         self.scope_patch = patch.object(
             gateway_module, "SCOPE_PATH", os.path.join(self.tmp.name, "scope.json"))
+        self.corrupted_path = os.path.join(self.tmp.name, "corrupted-events.jsonl")
+        self.corrupted_patch = patch.object(
+            gateway_module, "CORRUPTED_PATH", self.corrupted_path)
         self.inbox_patch.start()
         self.health_patch.start()
         self.scope_patch.start()
+        self.corrupted_patch.start()
         self.addCleanup(self.inbox_patch.stop)
         self.addCleanup(self.health_patch.stop)
         self.addCleanup(self.scope_patch.stop)
+        self.addCleanup(self.corrupted_patch.stop)
         self.gateway = object.__new__(gateway_module.Gateway)
         self.gateway.decrypt_envelope = lambda envelope: {"value": envelope["id"]}
-        self.gateway._dispatch_lock = threading.Lock()
-        self.gateway._dispatch_cancel = threading.Event()
-        self.gateway._dispatch_pending = False
+        self.gateway._dispatch_locks = {}
+        self.gateway._dispatch_lock_guard = threading.Lock()
+        self.gateway._dispatch_cancel = []
+        self.gateway._dispatch_pending = set()
+        self.gateway._corrupted_events = set()
         self.gateway._delegation_poll_lock = threading.Lock()
         self.gateway.delegation = None
         self.gateway.muse_dispatch = None
@@ -86,11 +93,37 @@ class RetainedInboxTests(unittest.TestCase):
             dispatched.append((items, playthrough_id))
             done.set()
 
-        self.gateway.muse_dispatch = SimpleNamespace(dispatch=dispatch)
+        self.gateway.muse_dispatch = SimpleNamespace(dispatch=dispatch, session_key=lambda record: ("role-1", False))
         with patch.object(gateway_module, "PROVIDER", "muse"):
             self.gateway.pull_inbox()
         self.assertTrue(done.wait(2))
         self.assertEqual(dispatched, [([item], "play")])
+
+    def test_different_roles_dispatch_concurrently(self):
+        items = [event(1), event(2)]
+        for index, item in enumerate(items):
+            item['route'] = {'role': 'subagent', 'roleId': f'role-{index}'}
+        self.gateway.scope = {'playthroughId': 'play', 'packId': 'pack'}
+        self.gateway.session_token = 'token'
+        self.gateway.mcp_url = 'https://worker.example/mcp'
+        self.gateway.mcp_call = lambda _name, args: {
+            'content': [{'text': json.dumps({'items': items if args['cursor'] == 0 else []})}]
+        }
+        barrier = threading.Barrier(2)
+        finished = []
+
+        def dispatch(role_items, *_args, **_kwargs):
+            barrier.wait(timeout=2)
+            finished.append(role_items[0]['envelope']['id'])
+
+        self.gateway.muse_dispatch = SimpleNamespace(
+            dispatch=dispatch, session_key=lambda record: (record['route']['roleId'], False))
+        with patch.object(gateway_module, 'PROVIDER', 'muse'):
+            self.gateway.pull_inbox()
+        deadline = time.time() + 2
+        while len(finished) < 2 and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(set(finished), {'event-1', 'event-2'})
 
     def test_bad_first_envelope_does_not_skip_later_events(self):
         self.gateway.decrypt_envelope = lambda envelope: (
@@ -100,10 +133,17 @@ class RetainedInboxTests(unittest.TestCase):
         self.gateway.mcp_call = lambda name, args: {
             "content": [{"text": json.dumps({"items": [event(1), event(2)]})}]
         }
-        with self.assertRaises(ValueError):
-            self.gateway.pull_inbox()
-        self.assertFalse(os.path.exists(os.path.join(self.inbox, "event-2.json")))
-        self.assertFalse(os.path.exists(gateway_module.HEALTH_PATH))
+        self.gateway.pull_inbox()
+        self.assertFalse(os.path.exists(os.path.join(self.inbox, "event-1.json")))
+        self.assertTrue(os.path.exists(os.path.join(self.inbox, "event-2.json")))
+        self.assertTrue(os.path.exists(gateway_module.HEALTH_PATH))
+        self.assertTrue(os.path.exists(self.corrupted_path))
+        with open(self.corrupted_path, encoding="utf-8") as f:
+            records = [json.loads(line) for line in f]
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["eventId"], "event-1")
+        self.assertEqual(records[0]["cursor"], 1)
+        self.assertIn("bad ciphertext", records[0]["error"])
 
     def test_missing_pong_reconnects(self):
         class SilentSocket:

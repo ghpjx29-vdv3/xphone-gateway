@@ -41,6 +41,7 @@ class LeaseRenewal:
 
     def run(self) -> None:
         next_at = time.monotonic() + 30
+        failures = 0
         while not self.stop_signal.wait(1):
             if self.cancel and self.cancel.is_set():
                 return
@@ -49,10 +50,15 @@ class LeaseRenewal:
             try:
                 self.mcp_call("xphone.renew_event", {"eventId": self.event_id, "leaseId": self.lease_id})
                 next_at = time.monotonic() + 30
+                failures = 0
             except Exception:
-                self.lost = True
-                log.warning("muse lease renewal lost: event=%s", self.event_id)
-                return
+                failures += 1
+                if failures >= 3:
+                    self.lost = True
+                    log.warning("muse lease renewal lost: event=%s", self.event_id)
+                    return
+                next_at = time.monotonic() + 5
+                log.warning("muse lease renewal retry: event=%s attempt=%s", self.event_id, failures)
 
     def __enter__(self):
         self.thread.start()
@@ -198,11 +204,14 @@ class MuseDispatch:
                 path.unlink()
                 continue
             attempt = self.state["events"].setdefault(event_id, {"failures": 0, "nextAt": 0})
-            if (not attempt.get("phase2Started") and attempt.get("step", 0) > 0
-                    and record["decrypted"].get("type") == "journal.main_record.requested"):
+            is_journal = (record["decrypted"].get("type") == "journal.main_record.requested" or
+                          record.get("route", {}).get("surfaceId") == "journal.main_record")
+            if not attempt.get("phase2Started") and is_journal:
                 first_batch = batch_id(record["packId"], playthrough_id, event_id, 0)
                 if delivery_status(mcp_call, first_batch) == "applied":
-                    attempt.update({"phase2Started": True, "phase1Batch": first_batch})
+                    post_step = max(1, attempt.get("step", 1))
+                    post_batch = attempt.get("batchId") or batch_id(record["packId"], playthrough_id, event_id, post_step)
+                    attempt.update({"phase2Started": True, "phase1Batch": first_batch, "step": post_step, "batchId": post_batch})
                     self.save()
             status = tool_data(mcp_call, "xphone.get_event_status", {"eventId": event_id})
             if status["status"] == "completed":
@@ -243,8 +252,9 @@ class MuseDispatch:
                         if outcome == "pending":
                             raise AwaitingDelegations("waiting for delegated actions to be applied")
                         sid = self.session_id(key)
+                        post_batch = attempt.get("batchId") or batch_id(record["packId"], playthrough_id, event_id, attempt.get("step", 1))
                         post_prompt = self.context.post_journal_prompt(
-                            record, record["packId"], playthrough_id, attempt["batchId"],
+                            record, record["packId"], playthrough_id, post_batch,
                             self.memory.view(record["packId"], playthrough_id, record["route"]),
                             journal_summary=attempt.get("replyText", "")[:500])
                         if outcome == "rejected":
@@ -275,11 +285,12 @@ class MuseDispatch:
                     self.save()
                     current = delivery_status(mcp_call, batch)
                     if current == "rejected":
-                        attempt.update({"step": step + 1, "rejectedBatchId": batch})
+                        attempt.update({"step": step + 1, "rejectedBatchId": batch,
+                                        "museStarted": False, "museSent": False})
                         self.save()
                         raise RuntimeError("delivery rejected")
                     session_id = None
-                    if current == "unknown":
+                    if current == "unknown" and not attempt.get("museStarted"):
                         session_id = self.session_id(key)
                         prompt = self.context.prompt(record, record["packId"], playthrough_id, batch,
                                                      self.memory.view(record["packId"], playthrough_id,
@@ -287,12 +298,15 @@ class MuseDispatch:
                                                      self.state["promptVersions"].get(key) != self.context.version(),
                                                      rejected_batch=attempt.get("rejectedBatchId"),
                                                      rejected_reason=self.rejection_reason(attempt.get("rejectedBatchId")))
+                        attempt["museStarted"] = True
+                        self.save()
                         result = self.cli("send", prompt, "--thread", session_id, "--wait", str(MUSE_WAIT_SECONDS))
                         if result.get("sent") is not True:
                             raise MuseCliError("send", reason="not-sent")
                         self.state["promptVersions"][key] = self.context.version()
                         reply_text = str((result.get("reply") or {}).get("text") or "")
                         attempt["replyText"] = reply_text[:4000]
+                        attempt["museSent"] = True
                         self.save()
                     else:
                         reply_text = attempt.get("replyText", "")
@@ -304,7 +318,8 @@ class MuseDispatch:
                             continue
                     current = self.wait_delivery(mcp_call, batch, cancel, renewal)
                     if current == "rejected":
-                        attempt.update({"step": step + 1, "rejectedBatchId": batch})
+                        attempt.update({"step": step + 1, "rejectedBatchId": batch,
+                                        "museStarted": False, "museSent": False})
                         self.save()
                         raise RuntimeError("delivery rejected")
                     if current != "applied":

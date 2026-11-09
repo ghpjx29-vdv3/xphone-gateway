@@ -65,7 +65,6 @@ def main() -> None:
         write_key(bundle["scope"], content_key)
         write_secret(TOKEN_PATH, token)
         print("配对成功！凭证已安全保存到 ~/.config/xphone/ (权限 0600)。", flush=True)
-        print(f"\n个人令牌 (若 Muse 平台连接器需手动填 API Key):\n{token}\n", flush=True)
         return
     raise TimeoutError("XPhone 配对超时，配对码已失效，请重新运行。")
 
