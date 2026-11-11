@@ -8,6 +8,9 @@ import urllib.request
 WORKER_URL = os.environ.get(
     "XPHONE_WORKER_URL", "https://xphone-agent-worker.xphone-maps-gateway.workers.dev"
 ).rstrip("/")
+KEY_TRANSFER_URL = os.environ.get(
+    "XPHONE_KEY_TRANSFER_URL", "https://phone.xenoflex.xyz"
+).rstrip("/")
 TOKEN_PATH = os.path.join(os.path.expanduser("~"), ".config", "xphone", "account.token")
 
 
@@ -26,7 +29,8 @@ def request(path: str, body: dict | None = None, token: str | None = None) -> di
         headers["Content-Type"] = "application/json"
     if token:
         headers["Authorization"] = f"Bearer {token}"
-    req = urllib.request.Request(WORKER_URL + path, data=payload, headers=headers,
+    base_url = KEY_TRANSFER_URL if path.startswith("/account/key-transfer/") else WORKER_URL
+    req = urllib.request.Request(base_url + path, data=payload, headers=headers,
                                  method="POST" if body is not None else "GET")
     with urllib.request.urlopen(req, timeout=60) as response:
         return json.load(response)
