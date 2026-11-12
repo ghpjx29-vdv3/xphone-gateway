@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Show an 8-character code and receive the account token and content key."""
 
+import argparse
 import base64
 import os
 import time
@@ -38,12 +39,25 @@ def write_secret(path: str, value: str) -> None:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--provider", choices=["muse", "chatgpt"], default="muse")
+    parser.add_argument("--confirm-receipt", action="store_true")
+    args = parser.parse_args()
     private_key = ec.generate_private_key(ec.SECP256R1())
     public = private_key.public_key().public_numbers()
     encode = lambda integer: base64.urlsafe_b64encode(integer.to_bytes(32, "big")).rstrip(b"=").decode()
-    started = request("/pair/start", {"publicKey": {"kty": "EC", "crv": "P-256",
-                                                    "x": encode(public.x), "y": encode(public.y)},
-                                      "provider": "muse"})
+    start = {"publicKey": {"kty": "EC", "crv": "P-256", "x": encode(public.x), "y": encode(public.y)},
+             "provider": args.provider, "confirmReceipt": args.confirm_receipt}
+    for attempt in range(45):
+        try:
+            started = request("/pair/start", start)
+            break
+        except urllib.error.URLError as error:
+            if attempt == 44 or isinstance(error, urllib.error.HTTPError) and error.code not in (404, 502, 503, 504):
+                raise
+            time.sleep(2)
+    if args.confirm_receipt:
+        print(f"XPHONE_PAIR_CODE={started['code']}", flush=True)
     print("\n" + "=" * 52, flush=True)
     print(f"XPhone 8 位配对码: {started['code']} (有效期 5 分钟)", flush=True)
     print("请在 GIGI 手机前端的「个人代理配对」页输入该配对码并确认授权。", flush=True)
@@ -64,6 +78,15 @@ def main() -> None:
         token = unwrap(private_key, bundle["token"])
         write_key(bundle["scope"], content_key)
         write_secret(TOKEN_PATH, token)
+        if args.confirm_receipt:
+            for attempt in range(5):
+                try:
+                    request("/pair/complete", {"code": started["code"], "secret": started["secret"]})
+                    break
+                except urllib.error.URLError as error:
+                    if attempt == 4 or isinstance(error, urllib.error.HTTPError) and error.code < 500:
+                        raise
+                    time.sleep(2)
         print("配对成功！凭证已安全保存到 ~/.config/xphone/ (权限 0600)。", flush=True)
         return
     raise TimeoutError("XPhone 配对超时，配对码已失效，请重新运行。")

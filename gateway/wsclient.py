@@ -19,6 +19,8 @@ import os
 import ssl
 from urllib.parse import urlparse
 
+from account_api import gateway_endpoint
+
 OP_TEXT = 0x1
 OP_CLOSE = 0x8
 OP_PING = 0x9
@@ -43,7 +45,8 @@ class WSClient:
         self._closed = False
 
     async def connect(self) -> None:
-        u = urlparse(self.url)
+        endpoint, relay_headers = gateway_endpoint(self.url)
+        u = urlparse(endpoint)
         host, port = u.hostname, u.port or 443
         path = u.path or "/"
         if u.query:
@@ -52,7 +55,7 @@ class WSClient:
         # Plain TCP (optionally through an HTTP CONNECT tunnel), blocking is
         # fine here because it is quick; the socket is handed to asyncio below.
         import socket as _socket
-        if self.proxy_url:
+        if self.proxy_url and not relay_headers:
             p = urlparse(self.proxy_url)
             sock = _socket.create_connection((p.hostname, p.port or 3128),
                                              timeout=20)
@@ -71,13 +74,17 @@ class WSClient:
             sock = _socket.create_connection((host, port), timeout=20)
         sock.setblocking(False)
 
-        ctx = ssl.create_default_context()
-        reader, writer = await asyncio.open_connection(
-            sock=sock, ssl=ctx, server_hostname=host,
-            ssl_handshake_timeout=20)
+        if relay_headers:
+            reader, writer = await asyncio.open_connection(sock=sock)
+        else:
+            ctx = ssl.create_default_context()
+            reader, writer = await asyncio.open_connection(
+                sock=sock, ssl=ctx, server_hostname=host,
+                ssl_handshake_timeout=20)
 
         key = base64.b64encode(os.urandom(16)).decode()
         # NOTE: no Origin header on purpose; the server rejects present Origin.
+        extra_headers = "".join(f"{name}: {value}\r\n" for name, value in relay_headers.items())
         req = (
             f"GET {path} HTTP/1.1\r\n"
             f"Host: {host}\r\n"
@@ -87,6 +94,7 @@ class WSClient:
             "Sec-WebSocket-Version: 13\r\n"
             f"Sec-WebSocket-Protocol: {self.subprotocol}\r\n"
             f"User-Agent: {self.user_agent}\r\n"
+            f"{extra_headers}"
             "\r\n"
         )
         writer.write(req.encode())
@@ -108,13 +116,8 @@ class WSClient:
         self.reader, self.writer = reader, writer
 
     async def _read_http_head(self, reader: asyncio.StreamReader) -> str:
-        buf = b""
-        while b"\r\n\r\n" not in buf:
-            chunk = await asyncio.wait_for(reader.read(4096), timeout=20)
-            if not chunk:
-                break
-            buf += chunk
-        return buf.decode("latin1", errors="replace")
+        head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=20)
+        return head.decode("latin1")
 
     async def _read_exact(self, n: int) -> bytes:
         data = b""
