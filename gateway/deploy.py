@@ -114,13 +114,13 @@ def wait_for_relay(binding, process):
         "X-XPhone-Relay-Key": binding["relaySecret"],
         "X-XPhone-Public-URL": binding["relayOrigin"] + "/health",
     })
-    deadline = time.monotonic() + 60
+    deadline = time.monotonic() + 120
     while time.monotonic() < deadline and process.poll() is None:
         try:
             with urlopen(request, timeout=5) as response:
                 if json.load(response).get("ok") is True:
                     return
-        except URLError:
+        except (URLError, TimeoutError):
             pass
         time.sleep(1)
     raise RuntimeError(f"XPhone did not become ready. See {SETUP / 'transport.log'}.")
