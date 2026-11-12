@@ -203,7 +203,7 @@ class MuseContext:
         if event.get("type") == "journal.main_record.requested":
             parts.append("【故事续写直接写作阶段 (Phase 1)】\n在下方“本轮动作任务文件”同名的 .actions.json 文件中写入只含一个 journal.appendMainRecord 的动作数组，字段为 type 与 markdown。调用 xphone.submit_task_actions，只填任务文档的完整路径。网关自动发送单帧草稿并提交正文；正文落盘后进入下一阶段。")
         if route["role"] == "os-agent":
-            parts.append(f"需要其他 App 执行具体操作时，在云电脑目录 {current['localContent']['taskDirectory']} 写一份 <uuid4>.md 任务文档。“目标:”只能从下方“允许交办的目标”复制完整值；调用 xphone.delegate_task 时只填文档绝对路径。成功回执只表示角色旁聊已接收；执行结果可从下一轮历史摘要了解。")
+            parts.append(f"需要其他 App 执行具体操作时，在云电脑目录 {current['localContent']['taskDirectory']} 写一份 <uuid4>.md 任务文档。“目标:”只能从下方“允许交办的目标”复制完整值；调用 xphone.delegate_task 时只填文档绝对路径。返回任务编号表示已受理，可用 xphone.get_delegation 查看进度。收到 applied 后才能告知用户操作已完成。")
             parts.append("个人代理自身回复：在下方“本轮动作任务文件”同名的 .actions.json 文件写纯语义动作数组，调用 xphone.submit_task_actions，只填任务文档完整路径。")
         parts.append(self.template(record, "tool-reminder.md"))
         health = self.timed_note(record, "health.md")

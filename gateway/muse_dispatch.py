@@ -17,6 +17,7 @@ log = logging.getLogger("xphone-gateway")
 EVENT_LEASE_SECONDS = 90
 MUSE_WAIT_SECONDS = 60
 DELIVERY_WAIT_SECONDS = 120
+DELEGATION_CHECK_INTERVAL = 20
 
 
 class MuseCliError(Exception):
@@ -28,6 +29,10 @@ class MuseCliError(Exception):
 
 
 class AwaitingDelegations(Exception):
+    pass
+
+
+class FailedDelegations(Exception):
     pass
 
 
@@ -73,6 +78,7 @@ class MuseDispatch:
     def __init__(self, inbox: str, state_path: str):
         self.inbox, self.state_path = Path(inbox), Path(state_path)
         self.state_lock = threading.RLock()
+        self.session_locks = {}
         self.state = json.loads(self.state_path.read_text(encoding="utf-8")) if self.state_path.exists() else {
             "sessions": {}, "events": {},
         }
@@ -114,8 +120,12 @@ class MuseDispatch:
             return f"{scope}:ops:{record['id']}", True
         return f"{scope}:{route['roleId']}", False
 
-    def session_id(self, key: str) -> str:
+    def session_lock(self, key: str):
         with self.state_lock:
+            return self.session_locks.setdefault(key, threading.RLock())
+
+    def session_id(self, key: str) -> str:
+        with self.session_lock(key):
             sessions = self.state["sessions"]
             if key not in sessions:
                 result = self.cli("session-start", "--title", f"XPhone {key}")
@@ -132,9 +142,25 @@ class MuseDispatch:
             return None
         return json.loads(receipt.read_text(encoding="utf-8"))["decrypted"].get("reason")
 
+    def on_receipt(self, batch: str) -> None:
+        for attempt in self.state["events"].copy().values():
+            if batch == attempt.get("phase1Batch") or batch == attempt.get("batchId") or any(
+                record.get("batchId") == batch for path in attempt.get("delegations", [])
+                if (record := self.state.get("delegations", {}).get(path))
+            ):
+                attempt["nextAt"] = 0
+        self.save()
+
     def finish(self, item: dict, record: dict, mcp_call, lease_id: str, batches: list[str],
-               reply_text: str, source: str, key: str, temporary: bool) -> None:
+               reply_text: str, source: str, key: str, temporary: bool, outcome: str | None = None) -> None:
         event_id = record["id"]
+        if record["route"]["role"] == "os-agent":
+            if outcome is None:
+                outcome = self.delegation_outcome(event_id, self.state["events"][event_id], mcp_call)
+            if outcome == "pending":
+                raise AwaitingDelegations("waiting for delegated actions to be applied")
+            if outcome in ("failed", "rejected"):
+                raise FailedDelegations(outcome)
         self.memory.commit(record["packId"], record["playthroughId"], event_id,
                            record["route"], batches, reply_text[:500], source)
         mcp_call("xphone.finish_event", {"eventId": event_id, "leaseId": lease_id, "status": "completed"})
@@ -166,14 +192,31 @@ class MuseDispatch:
             else:
                 time.sleep(2)
 
-    def phase2_outcome(self, attempt: dict, mcp_call) -> str:
+    def delegation_outcome(self, event_id: str, attempt: dict, mcp_call) -> str:
+        runtime = tool_data(mcp_call, "xphone.get_event_status", {"eventId": event_id}).get("delegationStatus")
+        local = self.legacy_delegation_outcome(attempt, mcp_call, runtime not in (None, "none"))
+        for outcome in ("pending", "failed", "rejected"):
+            if outcome in (runtime, local):
+                return outcome
+        return "ready" if runtime == "applied" or local == "ready" else "missing"
+
+    def phase2_outcome(self, event_id: str, attempt: dict, mcp_call) -> str:
+        outcome = self.delegation_outcome(event_id, attempt, mcp_call)
+        if outcome == "missing" and attempt.get("phase2NoLinkage"):
+            return "ready"
+        if outcome == "failed":
+            raise FailedDelegations(outcome)
+        return outcome
+
+    def legacy_delegation_outcome(self, attempt: dict, mcp_call, runtime_tracks_jobs: bool) -> str:
         paths = attempt.get("delegations") or []
         if not paths:
-            return "ready" if attempt.get("phase2NoLinkage") else "missing"
+            return "missing"
         records = [self.state.get("delegations", {}).get(path) for path in paths]
         if any(record is None for record in records):
             return "missing"
-        records = [record for record in records if not record.get("superseded")]
+        records = [record for record in records if not record.get("superseded")
+                   and (not runtime_tracks_jobs or not record.get("jobId"))]
         if not records:
             return "missing"
         statuses = [delivery_status(mcp_call, record["batchId"]) for record in records]
@@ -183,9 +226,7 @@ class MuseDispatch:
             self.save()
         if all(status == "applied" for status in statuses):
             return "ready"
-        if any(status == "rejected" for status in statuses):
-            return "rejected"
-        return "pending"
+        return "rejected" if all(status in ("applied", "rejected") for status in statuses) else "pending"
 
     def dispatch(self, items: list, mcp_call, playthrough_id: str, pack_id: str | None = None,
                  cancel: threading.Event | None = None) -> None:
@@ -204,6 +245,8 @@ class MuseDispatch:
                 path.unlink()
                 continue
             attempt = self.state["events"].setdefault(event_id, {"failures": 0, "nextAt": 0})
+            if time.time() < attempt["nextAt"]:
+                return
             is_journal = (record["decrypted"].get("type") == "journal.main_record.requested" or
                           record.get("route", {}).get("surfaceId") == "journal.main_record")
             if not attempt.get("phase2Started") and is_journal:
@@ -220,34 +263,35 @@ class MuseDispatch:
                 self.state["events"].pop(event_id, None)
                 self.save()
                 continue
+            if status["status"] == "failed" and attempt.get("delegationFailed"):
+                return
             lease_current = (status["status"] == "running" and
                              status["updatedAt"] + EVENT_LEASE_SECONDS * 1000 > time.time() * 1000)
-            if attempt.get("phase2Started") and self.phase2_outcome(attempt, mcp_call) == "ready" and lease_current and attempt.get("leaseId"):
-                key, temporary = self.session_key(record)
-                self.finish(item, record, mcp_call, attempt["leaseId"], [attempt["phase1Batch"]],
-                            attempt.get("replyText", ""), "reply_text", key, temporary)
-                continue
-            if lease_current:
+            resume = lease_current and attempt.get("waitingDelegations") and attempt.get("leaseId")
+            if lease_current and not resume:
                 attempt["nextAt"] = status["updatedAt"] / 1000 + EVENT_LEASE_SECONDS + 1
                 self.save()
                 return
-            if time.time() < attempt["nextAt"]:
-                return
-            started = tool_data(mcp_call, "xphone.start_event", {"eventId": event_id})
-            if not started.get("claimed"):
-                return
-            lease_id = started["leaseId"]
-            attempt["leaseId"] = lease_id
-            self.save()
+            if resume:
+                lease_id = attempt["leaseId"]
+            else:
+                started = tool_data(mcp_call, "xphone.start_event", {"eventId": event_id})
+                if not started.get("claimed"):
+                    return
+                lease_id = started["leaseId"]
+                attempt["leaseId"] = lease_id
+                self.save()
             try:
+                if resume:
+                    mcp_call("xphone.renew_event", {"eventId": event_id, "leaseId": lease_id})
                 with LeaseRenewal(mcp_call, event_id, lease_id, cancel) as renewal:
                     event_type = record["decrypted"].get("type")
                     key, temporary = self.session_key(record)
                     if attempt.get("phase2Started"):
-                        outcome = self.phase2_outcome(attempt, mcp_call)
+                        outcome = self.phase2_outcome(event_id, attempt, mcp_call)
                         if outcome == "ready":
                             self.finish(item, record, mcp_call, lease_id, [attempt["phase1Batch"]],
-                                        attempt.get("replyText", ""), "reply_text", key, temporary)
+                                        attempt.get("replyText", ""), "reply_text", key, temporary, outcome)
                             continue
                         if outcome == "pending":
                             raise AwaitingDelegations("waiting for delegated actions to be applied")
@@ -267,10 +311,10 @@ class MuseDispatch:
                             attempt["replyText"] = f"{attempt.get('replyText', '')}\n\n[Post-Journal]: {post_reply}"[:4000]
                         attempt["phase2NoLinkage"] = "无需联动" in post_reply
                         self.save()
-                        outcome = self.phase2_outcome(attempt, mcp_call)
+                        outcome = self.phase2_outcome(event_id, attempt, mcp_call)
                         if outcome == "ready":
                             self.finish(item, record, mcp_call, lease_id, [attempt["phase1Batch"]],
-                                        attempt.get("replyText", ""), "reply_text", key, temporary)
+                                        attempt.get("replyText", ""), "reply_text", key, temporary, outcome)
                             continue
                         if outcome == "pending":
                             raise AwaitingDelegations("waiting for delegated actions to be applied")
@@ -312,10 +356,12 @@ class MuseDispatch:
                         reply_text = attempt.get("replyText", "")
                     if record["route"]["role"] == "os-agent":
                         current = delivery_status(mcp_call, batch)
-                        if current == "unknown" and (attempt.get("delegations") or "无需联动" in reply_text):
-                            self.finish(item, record, mcp_call, lease_id, [], reply_text,
-                                        "reply_text" if reply_text else "delegation_only", key, temporary)
-                            continue
+                        if current == "unknown":
+                            outcome = self.delegation_outcome(event_id, attempt, mcp_call)
+                            if outcome != "missing" or "无需联动" in reply_text:
+                                self.finish(item, record, mcp_call, lease_id, [], reply_text,
+                                            "reply_text" if reply_text else "delegation_only", key, temporary, outcome)
+                                continue
                     current = self.wait_delivery(mcp_call, batch, cancel, renewal)
                     if current == "rejected":
                         attempt.update({"step": step + 1, "rejectedBatchId": batch,
@@ -353,7 +399,7 @@ class MuseDispatch:
                             attempt["replyText"] = reply_text[:4000]
                             attempt["phase2NoLinkage"] = "无需联动" in post_reply
                             self.save()
-                        outcome = self.phase2_outcome(attempt, mcp_call)
+                        outcome = self.phase2_outcome(event_id, attempt, mcp_call)
                         if outcome == "pending":
                             raise AwaitingDelegations("waiting for delegated actions to be applied")
                         if outcome != "ready":
@@ -373,12 +419,18 @@ class MuseDispatch:
                             log.warning("muse history fallback failed: %s", err)
                     source = "reply_text" if reply_text else "delivery_only"
                     self.finish(item, record, mcp_call, lease_id, batches_completed, reply_text,
-                                source, key, temporary)
+                                source, key, temporary, outcome if is_journal and step == 0 else None)
                     continue
             except AwaitingDelegations as error:
-                attempt["nextAt"] = time.time() + 30
+                attempt.update(waitingDelegations=True, nextAt=time.time() + DELEGATION_CHECK_INTERVAL)
                 self.save()
                 log.info("muse dispatch waiting: event=%s reason=%s", event_id, error)
+                return
+            except FailedDelegations as error:
+                mcp_call("xphone.finish_event", {"eventId": event_id, "leaseId": lease_id, "status": "failed"})
+                attempt.update(delegationFailed=True, waitingDelegations=False)
+                self.save()
+                log.warning("muse delegation failed: event=%s status=%s", event_id, error)
                 return
             except Exception as error:
                 failures = attempt["failures"] + 1

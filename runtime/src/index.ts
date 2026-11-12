@@ -70,7 +70,8 @@ const tools = [
   { name: 'xphone.read_inbox', description: 'Read incoming events from the phone client (user messages, system notifications). Cursor is a monotonically increasing integer for pagination.', inputSchema: { ...object, properties: { cursor: integer, limit: integer }, required: ['cursor'] } },
   { name: 'xphone.ack_inbox', description: 'Confirm you have processed events up to the given cursor. Unacked events will be redelivered.', inputSchema: { ...object, properties: { cursor: integer }, required: ['cursor'] } },
   { name: 'xphone.open_event_stream', description: 'Mint a one-time ticket to open the real-time event WebSocket connection.', inputSchema: { ...object, properties: {}, required: [] } },
-  { name: 'xphone.delegate_task', description: 'Delegate a task document on the agent computer to its subagent. Pass the absolute task document path only; the Worker never reads its contents. Returns delivery acknowledgement, not the execution result.', inputSchema: { ...object, properties: { taskPath: string }, required: ['taskPath'] } },
+  { name: 'xphone.delegate_task', description: 'Accept a local task document for asynchronous delegation. Pass only its absolute path. Returns a job ID and status; the subagent works independently.', inputSchema: { ...object, properties: { taskPath: string }, required: ['taskPath'] } },
+  { name: 'xphone.get_delegation', description: 'Check the status of an accepted delegation by job ID.', inputSchema: { ...object, properties: { jobId: string }, required: ['jobId'] } },
   { name: 'xphone.submit_task_actions', description: 'Submit actions for a task document. Pass taskPath alone for gateway sealing, or include a locally sealed v2 envelope to submit over HTTPS without a gateway WebSocket.', inputSchema: { ...object, properties: { taskPath: string,
     envelope: { ...object, properties: { id: string, kind: { type: 'string', const: 'action_batch' }, version: { type: 'integer', const: 2 },
       nonce: string, ciphertext: string, aad: string, header: { ...object, properties: { batchId: string, parentEventId: string,
@@ -109,9 +110,10 @@ const gatewayTools = new Set(['runtime.list_assets', 'runtime.read_asset', 'runt
 const chatgptTools = new Set(['runtime.list_assets', 'runtime.read_asset',
   'xphone.ack_inbox', 'xphone.start_event', 'xphone.renew_event',
   'xphone.finish_event', 'xphone.submit_encrypted_actions', 'xphone.submit_encrypted_journal_frame']);
+const museDelegationTools = new Set(['xphone.delegate_task', 'xphone.get_delegation', 'xphone.submit_task_actions']);
 const chatgptToolCatalog = tools.filter((item) =>
   (!gatewayTools.has(item.name) || chatgptTools.has(item.name))
-  && !['xphone.delegate_task', 'xphone.submit_task_actions'].includes(item.name))
+  && !museDelegationTools.has(item.name))
   .map((item) => ({ ...item, _meta: { securitySchemes: [{ type: 'oauth2', scopes: ['xphone:mcp'] }] } }));
 const publicPairingTools = pairingTools.map((item) => ({ ...item, _meta: { securitySchemes: [{ type: 'noauth' }] } }));
 const chatgptEvent = { name: 'xphone.event.created',
@@ -300,7 +302,7 @@ async function executeTool(name: string, args: any, env: Env, claims: AgentClaim
   if (gatewayTools.has(name) && !claims.gateway && !(claims.provider === 'chatgpt' && chatgptTools.has(name))) throw new Error('gateway tool required');
   if (['xphone.submit_encrypted_actions', 'xphone.submit_encrypted_journal_frame'].includes(name)
     && claims.provider !== 'chatgpt') throw new Error('ChatGPT provider required');
-  if (claims.provider === 'chatgpt' && ['xphone.delegate_task', 'xphone.submit_task_actions'].includes(name)) throw new Error('Muse gateway tool unavailable');
+  if (claims.provider === 'chatgpt' && museDelegationTools.has(name)) throw new Error('Muse gateway tool unavailable');
   if (name.startsWith('map.') || name === 'assets.get_place_reference') {
     const story = await manifest(env, claims.packId);
     if (!story.map) throw new Error('map unavailable');
@@ -411,10 +413,12 @@ async function executeTool(name: string, args: any, env: Env, claims: AgentClaim
       return { ticket, connection: base64url(new TextEncoder().encode(connectionName(claims))) };
     }
     case 'xphone.delegate_task': {
-      if (typeof args.taskPath !== 'string' || !args.taskPath.trim()) throw new Error('taskPath must be an absolute task document path');
-      const delegated = await call(broker, 'delegate-task', { taskPath: args.taskPath });
-      return { status: 'delegated', requestId: delegated.requestId, targetApp: delegated.targetApp, batchId: delegated.batchId };
+      if (!validId(args.taskPath, 4096)) throw new Error('taskPath must be an absolute task document path');
+      return call(broker, 'delegate-task', { taskPath: args.taskPath });
     }
+    case 'xphone.get_delegation':
+      if (typeof args.jobId !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(args.jobId)) throw new Error('job ID required');
+      return call(broker, 'delegation-status', { jobId: args.jobId });
     case 'xphone.submit_task_actions': {
       if (typeof args.taskPath !== 'string' || !args.taskPath.trim()) throw new Error('taskPath must be an absolute task document path');
       const direct = args.envelope !== undefined;
@@ -596,7 +600,7 @@ If pairing fails: ask the user to re-check the credentials on the pairing page (
   if (input.method === 'tools/list') return result({ tools: [...tools.filter((item) =>
     (claims.gateway || !gatewayTools.has(item.name) || claims.provider === 'chatgpt' && chatgptTools.has(item.name))
     && (!['xphone.submit_encrypted_actions', 'xphone.submit_encrypted_journal_frame'].includes(item.name) || claims.provider === 'chatgpt')
-    && (claims.provider !== 'chatgpt' || !['xphone.delegate_task', 'xphone.submit_task_actions'].includes(item.name)))
+    && (claims.provider !== 'chatgpt' || !museDelegationTools.has(item.name)))
     .map((item) => ({ ...item, _meta: { securitySchemes: [{ type: 'oauth2', scopes: ['xphone:mcp'] }] } })),
     ...(claims.provider === 'chatgpt' ? publicPairingTools : [])] });
   if (input.method === 'resources/list') return result({ resources: [

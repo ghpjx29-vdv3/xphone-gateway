@@ -37,7 +37,14 @@ export interface QueuedEnvelope {
 
 type Schedule = { id: string; deliverAt: number; expiresAt: number; envelope: SealedEnvelope };
 type EventExecution = { id: string; status: 'accepted' | 'running' | 'completed' | 'failed' | 'discarded';
-  attempts: number; route: AgentEventRoute; createdAt: number; updatedAt: number; leaseId?: string };
+  attempts: number; route: AgentEventRoute; createdAt: number; updatedAt: number; leaseId?: string;
+  delegationIds?: string[] };
+type DelegationJob = {
+  jobId: string; eventId: string; taskPath: string; createdAt: number;
+  status: 'accepted' | 'ready' | 'failed';
+  batchId?: string; step?: number; targetApp?: string; surfaceId?: string; error?: string;
+};
+type SubmissionReply = { ok: boolean; error?: string; envelope?: SealedEnvelope; frame?: SealedEnvelope };
 type PendingWebhook = { subscriptionId: string; eventId: string; cursor: number;
   createdAt: number; attempts: number; nextAt: number };
 type AccountPair = { scope: { packId: string; playthroughId: string; xphoneSha256: string };
@@ -47,15 +54,48 @@ const MAX_QUEUE = 512;
 const MAX_SCHEDULE = 32;
 const RETENTION_MS = 7 * 86400_000;
 const EVENT_LEASE_MS = 90_000;
+const DELEGATION_START_MS = 10 * 60_000;
 
 function json(value: unknown, status = 200): Response {
   return Response.json(value, { status, headers: { 'cache-control': 'no-store' } });
 }
 
 export class AgentConnection implements DurableObject {
-  private delegateWaiters = new Map<string, (reply: { ok: boolean; error?: string; targetApp?: string; batchId?: string; envelope?: SealedEnvelope; frame?: SealedEnvelope }) => void>();
+  private submissionWaiters = new Map<string, (reply: SubmissionReply) => void>();
   constructor(private state: DurableObjectState) {
     this.setupAutoResponse();
+  }
+
+  private async delegationStatus(storage: Pick<DurableObjectStorage, 'get'>, job: DelegationJob) {
+    if (job.batchId) {
+      const delivery = await storage.get<{ status: string }>(`delivery:${job.batchId}`);
+      if (delivery) return delivery.status;
+    }
+    if (job.status === 'failed') return 'failed';
+    if (job.createdAt + DELEGATION_START_MS <= Date.now()) return 'failed';
+    return job.status;
+  }
+
+  private async eventDelegations(storage: Pick<DurableObjectStorage, 'get'>, event: EventExecution) {
+    const jobs = await Promise.all((event.delegationIds || []).map(async (id) => {
+      const job = await storage.get<DelegationJob>(`task:${id}`);
+      if (!job) throw new Error('missing delegation job');
+      return { job, status: await this.delegationStatus(storage, job) };
+    }));
+    if (!jobs.length) return 'none';
+    const active = jobs.filter(({ job, status }) => !['rejected', 'failed'].includes(status) || !jobs.some((other) =>
+      job.surfaceId && other.job.surfaceId === job.surfaceId && (other.job.step || 0) > (job.step || 0)));
+    if (active.some(({ status }) => !['applied', 'rejected', 'failed'].includes(status))) return 'pending';
+    if (active.some(({ status }) => status === 'failed')) return 'failed';
+    return active.some(({ status }) => status === 'rejected') ? 'rejected' : 'applied';
+  }
+
+  private notifyDelegation(socket: WebSocket | undefined, job: DelegationJob): void {
+    if (!socket) return;
+    try {
+      socket.send(JSON.stringify({ type: job.status === 'ready' ? 'delegate-ready' : 'delegate-task',
+        jobId: job.jobId, taskPath: job.taskPath, deadlineAt: job.createdAt + DELEGATION_START_MS }));
+    } catch { /* The next agent connection replays durable jobs. */ }
   }
 
   private pairKey(scope: AccountPair['scope']): string {
@@ -113,8 +153,21 @@ export class AgentConnection implements DurableObject {
     return true;
   }
 
-  private async enqueue(direction: Direction, envelope: SealedEnvelope): Promise<{ status: 'accepted' | 'duplicate'; cursor: number }> {
+  private async enqueue(direction: Direction, envelope: SealedEnvelope, taskPath?: string): Promise<{ status: 'accepted' | 'duplicate'; cursor: number }> {
+    const taskKey = taskPath ? `task:${await sha256(taskPath)}` : undefined;
     const result = await this.state.storage.transaction(async (tx) => {
+      if (taskKey) {
+        const header = envelope.header!;
+        const job = await tx.get<DelegationJob>(taskKey);
+        const task = job || await tx.get<{ batchId: string; targetApp?: string }>(`task:${taskPath}`);
+        if (!task || task.batchId !== envelope.id || task.targetApp !== header.targetApp
+          || (job && (job.eventId !== header.parentEventId || job.surfaceId !== header.surfaceId
+            || job.step !== header.step || job.status !== 'ready'
+            || await this.delegationStatus(tx, job) === 'failed')))
+          throw new Error('task association mismatch');
+        const execution = await tx.get<EventExecution>(`event:${header.parentEventId}`);
+        if (execution?.status !== 'running') throw new Error('event is not running');
+      }
       const duplicate = await tx.get<number>(`dedupe:${direction}:${envelope.id}`);
       if (duplicate) return { status: 'duplicate' as const, cursor: duplicate };
       const last = await tx.get<number>(`sequence:${direction}`) || 0;
@@ -458,8 +511,8 @@ export class AgentConnection implements DurableObject {
         case 'event-status': {
           const execution = await this.state.storage.get<EventExecution>(`event:${body.id}`);
           if (!execution) return json({ status: 'unknown' });
-          const { leaseId: _leaseId, ...publicStatus } = execution;
-          return json(publicStatus);
+          const { leaseId: _leaseId, delegationIds: _delegationIds, ...publicStatus } = execution;
+          return json({ ...publicStatus, delegationStatus: await this.eventDelegations(this.state.storage, execution) });
         }
         case 'event-start': {
           const key = `event:${body.id}`;
@@ -493,10 +546,14 @@ export class AgentConnection implements DurableObject {
             if (execution.status === 'completed' || execution.status === 'discarded') return execution;
             if (execution.status !== 'running' || execution.leaseId !== body.leaseId
               || !['completed', 'failed'].includes(body.status)) throw new Error('invalid event transition');
+            const delegates = await this.eventDelegations(tx, execution);
+            if (delegates === 'pending' || (body.status === 'completed' && !['none', 'applied'].includes(delegates)))
+              return null;
             const next = { ...execution, status: body.status as 'completed' | 'failed', updatedAt: Date.now(), leaseId: undefined };
             await tx.put(key, next);
             return next;
           });
+          if (!result) return json({ error: 'delegations not complete' }, 409);
           for (const socket of this.state.getWebSockets()) {
             if (socket.deserializeAttachment()?.kind !== 'agent') continue;
             try { socket.send(JSON.stringify({ type: 'event-finished', eventId: body.id, status: result.status })); }
@@ -563,6 +620,13 @@ export class AgentConnection implements DurableObject {
           this.state.acceptWebSocket(pair[1], ['agent']);
           pair[1].serializeAttachment({ kind: 'agent' });
           pair[1].send(JSON.stringify({ type: 'ready' }));
+          for (const job of (await this.state.storage.list<DelegationJob>({ prefix: 'task:' })).values()) {
+            if (!job.jobId) continue;
+            const status = await this.delegationStatus(this.state.storage, job);
+            if (status !== 'accepted' && status !== 'ready') continue;
+            const parent = await this.state.storage.get<EventExecution>(`event:${job.eventId}`);
+            if (parent?.status === 'running') this.notifyDelegation(pair[1], job);
+          }
           return new Response(null, { status: 101, webSocket: pair[0], headers: { 'sec-websocket-protocol': `xphone-agent-ticket.${ticket}` } });
         }
         case 'enqueue': return json(await this.enqueue(body.direction, body.envelope));
@@ -614,32 +678,43 @@ export class AgentConnection implements DurableObject {
         }
         case 'delivery': return json(await this.state.storage.get(`delivery:${body.id}`) || { status: 'unknown' });
         case 'delegate-task': {
-          const agentSockets = this.state.getWebSockets().filter((item) => item.deserializeAttachment()?.kind === 'agent' && (item.readyState === undefined || item.readyState === 1));
-          const socket = agentSockets[agentSockets.length - 1];
-          if (!socket) return json({ error: 'gateway websocket unavailable' }, 503);
-          const requestId = crypto.randomUUID();
-          console.info('delegate-task forwarding', requestId);
-          const reply = await new Promise<{ ok: boolean; error?: string; targetApp?: string; batchId?: string }>((resolve) => {
-            const timeout = setTimeout(() => {
-              this.delegateWaiters.delete(requestId);
-              resolve({ ok: false, error: 'gateway acknowledgement timed out' });
-            }, 120_000);
-            this.delegateWaiters.set(requestId, (value) => {
-              clearTimeout(timeout);
-              this.delegateWaiters.delete(requestId);
-              resolve(value);
-            });
-            try { socket.send(JSON.stringify({ type: 'delegate-task', requestId, taskPath: body.taskPath })); }
-            catch {
-              this.delegateWaiters.get(requestId)?.({ ok: false, error: 'gateway websocket unavailable' });
-            }
+          const taskPath = body.taskPath as string;
+          const eventId = /^\/.*\/delegations\/([A-Za-z0-9_.:-]{1,120})\/[a-f0-9-]{36}\.md$/.exec(taskPath)?.[1];
+          if (!eventId || taskPath.slice(1).split('/').some((segment) => ['', '.', '..'].includes(segment)))
+            return json({ error: 'invalid task path' }, 400);
+          const jobId = await sha256(taskPath);
+          const registration = this.state.storage.transaction(async (tx) => {
+            const existing = await tx.get<DelegationJob>(`task:${jobId}`);
+            if (existing) return { job: existing, created: false };
+            const parent = await tx.get<EventExecution>(`event:${eventId}`);
+            if (parent?.status !== 'running' || parent.route.role !== 'os-agent') return null;
+            const accepted: DelegationJob = { jobId, eventId, taskPath, status: 'accepted', createdAt: Date.now() };
+            await tx.put(`task:${jobId}`, accepted);
+            await tx.put(`event:${eventId}`, { ...parent, delegationIds: [...(parent.delegationIds || []), jobId] });
+            return { job: accepted, created: true };
           });
-          console.info('delegate-task acknowledged', requestId, reply.ok, reply.batchId, reply.targetApp);
-          if (reply.ok && reply.batchId) await this.state.storage.put(`task:${body.taskPath}`,
-            { requestId, batchId: reply.batchId, targetApp: reply.targetApp, createdAt: Date.now() });
-          return reply.ok ? json({ status: 'delegated', requestId, targetApp: reply.targetApp,
-            batchId: reply.batchId, taskPath: body.taskPath })
-            : json({ error: reply.error || 'delegation failed' }, 502);
+          this.state.waitUntil(registration.then(async (registered) => {
+            if (!registered) return;
+            const { job } = registered;
+            const status = await this.delegationStatus(this.state.storage, job);
+            if (status === 'accepted' || status === 'ready') {
+              const sockets = this.state.getWebSockets().filter((socket) => socket.deserializeAttachment()?.kind === 'agent'
+                && (socket.readyState === undefined || socket.readyState === 1));
+              this.notifyDelegation(sockets[sockets.length - 1], job);
+            }
+          }));
+          const registered = await registration;
+          if (!registered) return json({ error: 'event is not running' }, 409);
+          const { job, created } = registered;
+          const status = created ? 'accepted' : await this.delegationStatus(this.state.storage, job);
+          return json({ jobId, status, batchId: job.batchId });
+        }
+        case 'delegation-status': {
+          const job = await this.state.storage.get<DelegationJob>(`task:${body.jobId}`);
+          if (!job) return json({ status: 'unknown' });
+          const status = await this.delegationStatus(this.state.storage, job);
+          const error = status === 'failed' ? job.error || 'delegation timed out before submitting actions' : undefined;
+          return json({ jobId: job.jobId, status, batchId: job.batchId, targetApp: job.targetApp, error });
         }
         case 'submit-task-actions': {
           const agentSockets = this.state.getWebSockets().filter((item) => item.deserializeAttachment()?.kind === 'agent' && (item.readyState === undefined || item.readyState === 1));
@@ -648,23 +723,23 @@ export class AgentConnection implements DurableObject {
           const requestId = crypto.randomUUID();
           const reply = await new Promise<{ ok: boolean; error?: string; envelope?: SealedEnvelope; frame?: SealedEnvelope }>((resolve) => {
             const timeout = setTimeout(() => {
-              this.delegateWaiters.delete(requestId);
+              this.submissionWaiters.delete(requestId);
               resolve({ ok: false, error: 'gateway acknowledgement timed out' });
             }, 120_000);
-            this.delegateWaiters.set(requestId, (value) => {
+            this.submissionWaiters.set(requestId, (value) => {
               clearTimeout(timeout);
-              this.delegateWaiters.delete(requestId);
+              this.submissionWaiters.delete(requestId);
               resolve(value);
             });
             try { socket.send(JSON.stringify({ type: 'submit-task-actions', requestId, taskPath: body.taskPath })); }
-            catch { this.delegateWaiters.get(requestId)?.({ ok: false, error: 'gateway websocket unavailable' }); }
+            catch { this.submissionWaiters.get(requestId)?.({ ok: false, error: 'gateway websocket unavailable' }); }
           });
           return reply.ok ? json({ requestId, envelope: reply.envelope, frame: reply.frame })
             : json({ error: reply.error || 'submission failed' }, 502);
         }
         case 'enqueue-task-actions': {
           const envelope = body.envelope as SealedEnvelope;
-          let delegationRequestId: string | undefined;
+          let taskPath: string | undefined;
           if (envelope.header?.origin === 'delegation') {
             if (body.direct) {
               const execution = await this.state.storage.get<EventExecution>(`event:${envelope.header.parentEventId}`);
@@ -672,18 +747,16 @@ export class AgentConnection implements DurableObject {
                 || envelope.header.step < 1 || !['messages', 'socialmedia', 'maps'].includes(envelope.header.targetApp))
                 return json({ error: 'event is not running' }, 400);
             } else {
-              const task = await this.state.storage.get<{ requestId: string; batchId: string; targetApp?: string }>(`task:${body.taskPath}`);
-              if (!task || task.batchId !== envelope.id || task.targetApp !== envelope.header.targetApp)
-                return json({ error: 'task association mismatch' }, 400);
-              delegationRequestId = task.requestId;
+              taskPath = body.taskPath;
             }
           } else if (envelope.header?.origin === 'event') {
             const execution = await this.state.storage.get<EventExecution>(`event:${envelope.header.parentEventId}`);
             if (!execution || execution.status !== 'running') return json({ error: 'event is not running' }, 400);
           }
+          if (body.frame && taskPath) return json({ error: 'delegation cannot submit a journal frame' }, 400);
           if (body.frame) await this.enqueue('client', body.frame as SealedEnvelope);
-          const result = await this.enqueue('client', envelope);
-          console.info('action batch', delegationRequestId || envelope.header?.parentEventId,
+          const result = await this.enqueue('client', envelope, taskPath);
+          console.info('action batch', envelope.header?.parentEventId,
             body.submitRequestId, envelope.id, envelope.header?.targetApp, result.status);
           return json({ ...result, batchId: envelope.id });
         }
@@ -798,31 +871,60 @@ export class AgentConnection implements DurableObject {
         }
         default: return json({ error: 'unknown operation' }, 404);
       }
-    } catch {
+    } catch (error) {
+      if (operation === 'enqueue-task-actions' && error instanceof Error
+        && ['task association mismatch', 'event is not running'].includes(error.message))
+        return json({ error: error.message }, 400);
       return json({ error: 'request rejected' }, 400);
     }
   }
 
-  webSocketMessage(socket: WebSocket, message: string | ArrayBuffer): void {
-    if (message === 'ping') socket.send('pong');
+  async webSocketMessage(socket: WebSocket, message: string | ArrayBuffer): Promise<void> {
+    if (message === 'ping') { socket.send('pong'); return; }
     if (socket.deserializeAttachment()?.kind !== 'agent' || typeof message !== 'string') return;
-    let reply: { type?: string; requestId?: string; ok?: boolean; error?: string; targetApp?: string; batchId?: string; envelope?: SealedEnvelope; frame?: SealedEnvelope };
+    let reply: SubmissionReply & { type?: string; requestId?: string; jobId?: string;
+      batchId?: string; step?: number; targetApp?: string; surfaceId?: string };
     try { reply = JSON.parse(message); } catch { return; }
-    if ((reply.type === 'delegate-ack' || reply.type === 'submit-actions-ack') && reply.requestId) {
-      this.delegateWaiters.get(reply.requestId)?.({ ok: reply.ok === true, error: reply.error,
-        targetApp: reply.targetApp, batchId: reply.batchId, envelope: reply.envelope, frame: reply.frame });
+    if (reply?.type === 'submit-actions-ack' && reply.requestId) {
+      this.submissionWaiters.get(reply.requestId)?.(reply);
+      return;
+    }
+    if (!reply?.jobId || !['delegate-prepared', 'delegate-failed'].includes(reply.type || '')) return;
+    const key = `task:${reply.jobId}`;
+    const prepared = await this.state.storage.transaction(async (tx) => {
+      const job = await tx.get<DelegationJob>(key);
+      if (!job) return;
+      const parent = await tx.get<EventExecution>(`event:${job.eventId}`);
+      if (parent?.status !== 'running') return;
+      const status = await this.delegationStatus(tx, job);
+      if (status !== 'accepted' && status !== 'ready') return;
+      if (reply.type === 'delegate-failed') {
+        await tx.put(key, { ...job, status: 'failed', error: reply.error });
+        return;
+      }
+      if (job.status === 'ready') return job;
+      if (!reply.batchId || !reply.targetApp || !reply.surfaceId || !Number.isSafeInteger(reply.step) || reply.step! < 1) return;
+      const ready: DelegationJob = { ...job, status: 'ready', batchId: reply.batchId, step: reply.step,
+        targetApp: reply.targetApp, surfaceId: reply.surfaceId };
+      await tx.put(key, ready);
+      return ready;
+    });
+    if (prepared) this.notifyDelegation(socket, prepared);
+    if (reply.type === 'delegate-failed') {
+      try { socket.send(JSON.stringify({ type: 'delegation-progress' })); }
+      catch { /* A reconnect will read the durable job status. */ }
     }
   }
 
   webSocketClose(socket: WebSocket): void {
     if (socket.deserializeAttachment()?.kind === 'agent') {
-      for (const done of this.delegateWaiters.values()) done({ ok: false, error: 'gateway websocket closed' });
+      for (const done of this.submissionWaiters.values()) done({ ok: false, error: 'gateway websocket closed' });
     }
     try { socket.close(1000, 'Closed'); } catch { /* already closed */ }
   }
   webSocketError(socket: WebSocket): void {
     if (socket.deserializeAttachment()?.kind === 'agent') {
-      for (const done of this.delegateWaiters.values()) done({ ok: false, error: 'gateway websocket error' });
+      for (const done of this.submissionWaiters.values()) done({ ok: false, error: 'gateway websocket error' });
     }
     try { socket.close(1011, 'Error'); } catch { /* already closed */ }
   }

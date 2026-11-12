@@ -87,6 +87,32 @@ class MuseDispatchTests(unittest.TestCase):
         self.assertEqual(view["surface"], "角色已回复。")
         self.assertEqual(view["ledger"][0]["source"], "reply_text")
 
+    def test_os_reply_applied_keeps_parent_leased_until_delegation_applies(self):
+        self.record["route"] = {"role": "os-agent", "roleId": "osAgent:main", "consumer": "os",
+                                "surfaceId": "agent.reply"}
+        (self.inbox / f"{self.event_id}.json").write_text(json.dumps(self.record), encoding="utf-8")
+        self.status = "applied"
+        event_status = {"status": "accepted", "delegationStatus": "pending"}
+
+        def mcp(name, args):
+            if name == "xphone.get_event_status":
+                return result(event_status)
+            return self.mcp(name, args)
+
+        self.dispatcher.dispatch([self.item], mcp, "play", pack_id="pack")
+        self.assertFalse(any(name in ("xphone.finish_event", "xphone.ack_inbox") for name, _ in self.calls))
+        self.dispatcher.state["events"][self.event_id]["nextAt"] = 0
+        event_status.update(status="running", updatedAt=int(time.time() * 1000))
+        self.dispatcher.dispatch([self.item], mcp, "play", pack_id="pack")
+        self.assertFalse(any(name == "xphone.finish_event" for name, _ in self.calls))
+        event_status["delegationStatus"] = "applied"
+        self.dispatcher.state["events"][self.event_id]["nextAt"] = 0
+        self.dispatcher.dispatch([self.item], mcp, "play", pack_id="pack")
+        names = [name for name, _ in self.calls]
+        self.assertEqual(names.count("xphone.start_event"), 1)
+        self.assertEqual(names.count("xphone.renew_event"), 2)
+        self.assertEqual(names[-2:], ["xphone.finish_event", "xphone.ack_inbox"])
+
     def test_unknown_delivery_keeps_event_and_backoff(self):
         self.dispatcher.context.prompt = lambda *_, **__: "prompt"
         sent = []
@@ -220,6 +246,7 @@ class MuseDispatchTests(unittest.TestCase):
         self.assertFalse(any(name == "xphone.finish_event" for name, _ in self.calls))
         self.assertEqual(self.dispatcher.state["events"][journal_event_id]["failures"], 0)
         status_map[child_batch] = "applied"
+        self.dispatcher.on_receipt(child_batch)
         event_status.update({"status": "running", "updatedAt": int(time.time() * 1000)})
         self.dispatcher.dispatch([item], mcp, "play", pack_id="pack")
         self.assertEqual(len(sent_prompts), 2)

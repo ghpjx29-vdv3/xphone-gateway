@@ -157,6 +157,8 @@ class Gateway:
             with open(tmp, "w") as f:
                 json.dump(record, f, ensure_ascii=False)
             os.replace(tmp, dest)
+            if envelope["kind"] == "receipt" and self.muse_dispatch:
+                self.muse_dispatch.on_receipt(decrypted["batchId"])
             log.info("inbox write: event=%s cursor=%s route=%s",
                      event_id, cursor,
                      (record["route"] or {}).get("role"))
@@ -312,15 +314,36 @@ class Gateway:
         except WSClientError as e:
             raise RuntimeError(f"ws connect: {e}") from None
         log.info("websocket connected; pulling inbox (ready is optional)")
+        launches: dict[str, asyncio.Task] = {}
+
+        async def launch_delegation(job_id: str, task_path: str, deadline_at: int) -> None:
+            try:
+                await asyncio.to_thread(self.delegation.launch, job_id, task_path, deadline_at)
+            except Exception as error:
+                log.exception("delegation launch failed: job=%s", job_id)
+                try:
+                    await ws.send_text(json.dumps({"type": "delegate-failed", "jobId": job_id,
+                                                   "error": str(error)}, ensure_ascii=False))
+                except (OSError, WSClientError):
+                    pass  # The next connection replays the job and reports its saved result.
+            finally:
+                launches.pop(job_id, None)
+
         # Pull immediately on (re)connect: the server does not reliably send
         # {"type":"ready"}, and the spec says to pull after notification/reconnect.
         try:
             await asyncio.to_thread(self.pull_inbox)
             awaiting_pong = False
+            next_delegation_check = time.monotonic()
             while not self._stop.is_set():
                 if int(time.time() * 1000) + 60_000 >= session_expires_at:
                     log.info("pack session expiring; reconnecting")
                     break
+                if self.muse_dispatch and time.monotonic() >= next_delegation_check:
+                    next_delegation_check = time.monotonic() + PING_INTERVAL
+                    if any(attempt.get("waitingDelegations") and attempt["nextAt"] <= time.time()
+                           for attempt in self.muse_dispatch.state["events"].copy().values()):
+                        await asyncio.to_thread(self.pull_inbox)
                 try:
                     msg = await asyncio.wait_for(ws.recv_text(),
                                                  timeout=PING_INTERVAL)
@@ -340,7 +363,7 @@ class Gateway:
                     self._record_health()
                     if self.muse_dispatch and any(
                         attempt.get("nextAt") and attempt["nextAt"] <= time.time()
-                        for attempt in self.muse_dispatch.state["events"].values()
+                        for attempt in self.muse_dispatch.state["events"].copy().values()
                     ):
                         await asyncio.to_thread(self.pull_inbox)
                     continue
@@ -367,20 +390,23 @@ class Gateway:
                     log.info("queue progress notification type=%s", mtype)
                     await asyncio.to_thread(self.pull_inbox)
                 elif mtype == "delegate-task" and self.delegation:
-                    request_id = data.get("requestId")
-                    log.info("delegation request received: request=%s", request_id)
+                    job_id = data["jobId"]
                     try:
-                        result = await asyncio.to_thread(self.delegation.accept, data.get("taskPath", ""),
-                                                         self.scope["packId"], self.scope["playthroughId"])
-                        await ws.send_text(json.dumps({"type": "delegate-ack", "requestId": request_id,
-                                                       "ok": True, "targetApp": result["targetApp"],
-                                                       "batchId": result["batchId"]}))
-                        log.info("delegation acknowledged: request=%s", request_id)
+                        association = await asyncio.to_thread(self.delegation.prepare, job_id, data["taskPath"],
+                                                              self.scope["packId"], self.scope["playthroughId"])
                     except Exception as error:
-                        log.error("delegation failed: request=%s error=%s\n%s",
-                                  request_id, str(error), traceback.format_exc())
-                        await ws.send_text(json.dumps({"type": "delegate-ack", "requestId": request_id,
-                                                       "ok": False, "error": str(error)}, ensure_ascii=False))
+                        log.exception("delegation preparation failed: job=%s", job_id)
+                        reply = {"type": "delegate-failed", "jobId": job_id, "error": str(error)}
+                    else:
+                        reply = {"type": "delegate-prepared", "jobId": job_id, **association}
+                    await ws.send_text(json.dumps(reply, ensure_ascii=False))
+                elif mtype == "delegate-ready" and self.delegation:
+                    job_id = data["jobId"]
+                    if job_id not in launches:
+                        launches[job_id] = asyncio.create_task(
+                            launch_delegation(job_id, data["taskPath"], data["deadlineAt"]))
+                elif mtype == "delegation-progress" and self.muse_dispatch:
+                    await asyncio.to_thread(self.pull_inbox)
                 elif mtype == "submit-task-actions" and self.delegation:
                     request_id = data.get("requestId")
                     try:

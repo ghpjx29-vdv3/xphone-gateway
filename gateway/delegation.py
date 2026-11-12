@@ -80,23 +80,19 @@ class Delegation:
                                      "taskPath": task_path, "state": state,
                                      "eventId": event_id, "step": step}, ensure_ascii=False) + "\n")
 
-    def accept(self, task_path: str, pack_id: str, playthrough_id: str) -> dict:
+    def prepare(self, job_id: str, task_path: str, pack_id: str, playthrough_id: str) -> dict:
         root = self.task_root(pack_id, playthrough_id)
         if not Path(task_path).is_absolute():
             raise ValueError("taskPath 必须是任务文档的绝对路径")
         path = Path(task_path).resolve()
-        if not TASK_NAME.fullmatch(path.name) or path.parent.parent != root.resolve():
+        if str(path) != task_path or not TASK_NAME.fullmatch(path.name) or path.parent.parent != root.resolve():
             raise ValueError("taskPath 必须指向当前游玩的 delegations/{eventId}/{uuid4}.md")
         key = str(path)
         existing = self.dispatcher.state["delegations"].get(key)
         if existing:
-            if existing["status"] == "applied":
-                return {"status": "delegated", "taskPath": task_path,
-                        "targetApp": existing["route"]["targetApp"], "batchId": existing["batchId"]}
-            if existing["status"] == "sent":
-                raise RuntimeError("这份任务文档已交办，尚未收到客户端 applied；修改任务请新建 <uuid4>.md 文件，不能原地修改后重试")
-            if existing["status"] == "rejected":
-                raise RuntimeError("任务已被客户端拒收，请新建任务文件")
+            existing["jobId"] = job_id
+            self.dispatcher.save()
+            return self.association(existing)
         if not path.exists():
             raise FileNotFoundError(f"找不到任务文件：{task_path}")
         parent_id = path.parent.name
@@ -108,45 +104,71 @@ class Delegation:
         if parent["packId"] != pack_id or parent["playthroughId"] != playthrough_id or parent["route"]["role"] != "os-agent":
             raise ValueError("父事件账号范围或角色不匹配")
         route = self.route(parent, app, page)
-        for previous in self.dispatcher.state["delegations"].values():
-            if (previous["eventId"] == parent_id and previous["route"]["surfaceId"] == route["surfaceId"]
-                    and (previous["status"] == "rejected" or previous.get("deliveryStatus") == "rejected")):
-                previous["superseded"] = True
-        attempt = self.dispatcher.state["events"].setdefault(parent_id, {"failures": 0, "nextAt": 0})
-        if existing:
-            step = existing["step"]
-        else:
-            start = 1  # step 0 belongs to the parent OS event, even when it has no App batch
-            step = max(start, attempt.get("nextDelegateStep", start))
+        with self.dispatcher.state_lock:
+            for previous in self.dispatcher.state["delegations"].values():
+                if (not previous.get("jobId") and previous["eventId"] == parent_id
+                        and previous["route"]["surfaceId"] == route["surfaceId"]
+                        and "rejected" in (previous["status"], previous.get("deliveryStatus"))):
+                    previous["superseded"] = True
+            attempt = self.dispatcher.state["events"].setdefault(parent_id, {"failures": 0, "nextAt": 0})
+            step = attempt.get("nextDelegateStep", 1)
             attempt["nextDelegateStep"] = step + 1
-        batch = batch_id(pack_id, playthrough_id, parent_id, step)
-        session_key, _ = self.dispatcher.session_key({**parent, "route": route})
-        record = {"status": "sending", "taskPath": task_path, "eventId": parent_id,
-                  "step": step, "batchId": batch, "route": route, "sessionKey": session_key,
-                  "packId": pack_id, "playthroughId": playthrough_id, "sentAt": time.time()}
-        self.dispatcher.state["delegations"][key] = record
-        self.dispatcher.save()
-        session_id = self.dispatcher.session_id(session_key)
-        memory = self.dispatcher.memory.view(pack_id, playthrough_id, route)
-        prompt = self.dispatcher.context.delegated_prompt(
-            parent, route, batch, step, task_path, memory,
-            self.dispatcher.state["promptVersions"].get(session_key) != self.dispatcher.context.version())
-        try:
-            result = self.dispatcher.cli("send", prompt, "--thread", session_id, "--wait", "60")
-            if result.get("sent") is not True:
-                raise RuntimeError("Muse 未确认任务送达")
-        except Exception:
-            self.dispatcher.state["delegations"].pop(key, None)
+            session_key, _ = self.dispatcher.session_key({**parent, "route": route})
+            record = {"status": "prepared", "jobId": job_id, "taskPath": task_path, "eventId": parent_id,
+                      "step": step, "batchId": batch_id(pack_id, playthrough_id, parent_id, step),
+                      "route": route, "sessionKey": session_key,
+                      "packId": pack_id, "playthroughId": playthrough_id}
+            self.dispatcher.state["delegations"][key] = record
+            attempt.setdefault("delegations", []).append(task_path)
             self.dispatcher.save()
-            log.error("delegate send failed: event=%s task=%s\n%s", parent_id, task_path, traceback.format_exc())
-            raise
-        record["status"] = "sent"
-        self.dispatcher.state["promptVersions"][session_key] = self.dispatcher.context.version()
-        attempt.setdefault("delegations", []).append(task_path)
-        self.dispatcher.save()
-        self.log_state(root, task_path, "sent", parent_id, step)
-        return {"status": "delegated", "taskPath": task_path,
-                "targetApp": app, "batchId": batch}
+        return self.association(record)
+
+    @staticmethod
+    def association(record: dict) -> dict:
+        route = record["route"]
+        return {"batchId": record["batchId"], "step": record["step"],
+                "targetApp": route["targetApp"], "surfaceId": route["surfaceId"]}
+
+    def launch(self, job_id: str, task_path: str, deadline_at: int) -> None:
+        record = self.dispatcher.state["delegations"].get(task_path)
+        if not record or record.get("jobId") != job_id:
+            raise RuntimeError("找不到已准备的派工")
+        session_key = record["sessionKey"]
+        with self.dispatcher.session_lock(session_key):
+            if record["status"] == "failed":
+                raise RuntimeError(record["error"])
+            if record["status"] != "prepared":
+                return
+            if time.time() * 1000 >= deadline_at:
+                raise RuntimeError("派工已超过等待提交的期限")
+            parent_id = record["eventId"]
+            pack_id, playthrough_id = record["packId"], record["playthroughId"]
+            route, batch, step = record["route"], record["batchId"], record["step"]
+            record.update(status="launching", sentAt=time.time())
+            self.dispatcher.save()
+            try:
+                parent = json.loads((self.dispatcher.inbox / f"{parent_id}.json").read_text(encoding="utf-8"))
+                session_id = self.dispatcher.session_id(session_key)
+                memory = self.dispatcher.memory.view(pack_id, playthrough_id, route)
+                prompt = self.dispatcher.context.delegated_prompt(
+                    parent, route, batch, step, task_path, memory,
+                    self.dispatcher.state["promptVersions"].get(session_key) != self.dispatcher.context.version())
+                result = self.dispatcher.cli("send", prompt, "--thread", session_id, "--wait", "60")
+                if result.get("sent") is not True:
+                    raise RuntimeError("Muse 未确认任务送达")
+            except Exception as error:
+                if getattr(error, "reason", None) == "TimeoutExpired":
+                    log.warning("Muse send outcome unknown: job=%s", job_id)
+                    return
+                if record["status"] == "launching":
+                    record.update(status="failed", error=str(error))
+                    self.dispatcher.save()
+                raise
+            if record["status"] == "launching":
+                record["status"] = "sent"
+            self.dispatcher.state["promptVersions"][session_key] = self.dispatcher.context.version()
+            self.dispatcher.save()
+            self.log_state(self.task_root(pack_id, playthrough_id), task_path, record["status"], parent_id, step)
 
     def prepare_actions(self, task_path: str, pack_id: str, playthrough_id: str,
                         key_bytes: bytes) -> dict:
@@ -158,7 +180,7 @@ class Delegation:
             raise ValueError("taskPath 必须指向当前游玩的任务文档")
         if delegated:
             record = self.dispatcher.state["delegations"].get(str(path))
-            if not record or record["status"] != "sent":
+            if not record or record["status"] not in ("launching", "sent"):
                 raise ValueError("没有运行中的派工；请核对原任务文档路径")
             batch = record["batchId"]
             event_id, step, route = record["eventId"], record["step"], record["route"]
@@ -206,7 +228,7 @@ class Delegation:
 
     def poll(self, mcp_call, pack_id: str, playthrough_id: str) -> None:
         for record in list(self.dispatcher.state["delegations"].values()):
-            if record["packId"] != pack_id or record["playthroughId"] != playthrough_id or record["status"] != "sent":
+            if record["packId"] != pack_id or record["playthroughId"] != playthrough_id or record["status"] not in ("launching", "sent", "failed"):
                 continue
             status = delivery_status(mcp_call, record["batchId"])
             if status not in ("applied", "rejected"):

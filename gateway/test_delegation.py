@@ -3,6 +3,7 @@
 import hashlib
 import json
 import tempfile
+import time
 import unittest
 import base64
 from pathlib import Path
@@ -25,7 +26,7 @@ class DelegationTests(unittest.TestCase):
             cache.private = base / "private"
             world = "# 世界观\n码头在城西。"
             manifest = {"packId": "pack", "version": "1", "documents": [
-                {"id": "world.overview", "sha256": hashlib.sha256(world.encode()).hexdigest(),
+                {"id": "world.overview", "title": "世界观", "sha256": hashlib.sha256(world.encode()).hexdigest(),
                  "consumer": ["os", "messages"]}], "runtimeAssets": []}
             calls = []
 
@@ -50,6 +51,7 @@ class DelegationTests(unittest.TestCase):
             inbox.mkdir()
             dispatcher = MuseDispatch(str(inbox), str(base / "state.json"))
             dispatcher.context.cache = cache
+            dispatcher.memory.content_base = cache.base
             record = {"id": "event-1", "packId": "pack", "playthroughId": "play",
                       "route": {"role": "os-agent", "roleId": "osAgent:window", "windowId": "window",
                                 "consumer": "os", "surfaceId": "agent.control"},
@@ -63,12 +65,16 @@ class DelegationTests(unittest.TestCase):
             secret_task = "让晚舟告诉用户码头今晚换班。"
             task_path.write_text(f"目标: messages / 晚舟 DM\n任务: {secret_task}\n", encoding="utf-8")
             sent = []
+            prepared_during_send = []
+            action_path = task_path.with_suffix(".actions.json")
+            action_path.write_text(json.dumps([{"type": "messages.append", "text": "今晚换班。"}]), encoding="utf-8")
 
             def cli(*args):
                 if args[0] == "session-start":
                     return {"session_id": "messages-session"}
                 if args[0] == "send":
                     sent.append(args[1])
+                    prepared_during_send.append(delegation.prepare_actions(str(task_path), "pack", "play", b"a" * 32))
                     return {"sent": True}
                 if args[0] == "history":
                     return {"messages": [{"role": "assistant", "text": f"已完成 {task_path}"}]}
@@ -77,17 +83,19 @@ class DelegationTests(unittest.TestCase):
             dispatcher.cli = cli
             delegation = Delegation(dispatcher, cache.base)
             with self.assertRaisesRegex(ValueError, "可交办列表.*messages / 晚舟"):
-                delegation.accept(str(task_path), "pack", "play")
+                delegation.prepare("job-1", str(task_path), "pack", "play")
             task_path.write_text(f"目标: messages / 晚舟\n任务: {secret_task}\n", encoding="utf-8")
-            ack = delegation.accept(str(task_path), "pack", "play")
-            self.assertEqual(ack["taskPath"], str(task_path))
+            ack = delegation.prepare("job-1", str(task_path), "pack", "play")
+            self.assertFalse(sent)
             self.assertEqual(ack["targetApp"], "messages")
+            with self.assertRaisesRegex(ValueError, "没有运行中的派工"):
+                delegation.prepare_actions(str(task_path), "pack", "play", b"a" * 32)
+            deadline = int(time.time() * 1000) + 60_000
+            delegation.launch("job-1", str(task_path), deadline)
             self.assertIn(f"打开任务文档：{task_path}", sent[0])
             self.assertNotIn(secret_task, sent[0])
             self.assertNotIn(ack["batchId"], sent[0])
-            action_path = task_path.with_suffix(".actions.json")
-            action_path.write_text(json.dumps([{"type": "messages.append", "text": "今晚换班。"}]), encoding="utf-8")
-            prepared = delegation.prepare_actions(str(task_path), "pack", "play", b"a" * 32)
+            prepared = prepared_during_send[0]
             envelope = prepared["envelope"]
             self.assertEqual(envelope["header"]["batchId"], ack["batchId"])
             self.assertEqual(envelope["version"], 2)
@@ -102,8 +110,9 @@ class DelegationTests(unittest.TestCase):
                 AESGCM(b"a" * 32).decrypt(decode(envelope["nonce"]), decode(envelope["ciphertext"]),
                                            json.dumps(tampered, ensure_ascii=False, separators=(",", ":")).encode())
             self.assertIn("messages / 晚舟", dispatcher.context.prompt(record, "pack", "play", "batch-1", {}, False))
-            with self.assertRaisesRegex(RuntimeError, "已交办"):
-                delegation.accept(str(task_path), "pack", "play")
+            self.assertEqual(delegation.prepare("job-1", str(task_path), "pack", "play"), ack)
+            delegation.launch("job-1", str(task_path), deadline)
+            self.assertEqual(len(sent), 1)
             self.assertEqual([name for name, _ in calls].count("runtime.read_document"), 1)
 
             delegation.poll(mcp, "pack", "play")
