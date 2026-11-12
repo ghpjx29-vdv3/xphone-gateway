@@ -1,0 +1,69 @@
+{
+  "name": "xphone-personal-gateway-runtime",
+  "main": "src/gatewayOrigin.ts",
+  "compatibility_date": "2026-10-29",
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "CONNECTIONS",
+        "class_name": "AgentConnection"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": [
+        "AgentConnection"
+      ]
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "AGENT_DOCUMENTS",
+      "bucket_name": "xphone-agent-documents"
+    }
+  ],
+  "ratelimits": [
+    {
+      "name": "MCP_IP_LIMITER",
+      "namespace_id": "110800",
+      "simple": {
+        "limit": 300,
+        "period": 60
+      }
+    },
+    {
+      "name": "ANON_PAIRING_LIMITER",
+      "namespace_id": "110801",
+      "simple": {
+        "limit": 60,
+        "period": 60
+      }
+    },
+    {
+      "name": "PAIR_CODE_LIMITER",
+      "namespace_id": "110802",
+      "simple": {
+        "limit": 5,
+        "period": 60
+      }
+    },
+    {
+      "name": "PAIR_CODE_GLOBAL_LIMITER",
+      "namespace_id": "110803",
+      "simple": {
+        "limit": 120,
+        "period": 60
+      }
+    }
+  ],
+  "vars": {
+    "CLIENT_ORIGINS": "https://phone.xenoflex.xyz,http://localhost:8081,http://127.0.0.1:8081,http://localhost:4173,http://127.0.0.1:4173"
+  },
+  "workers_dev": false,
+  "dev": {
+    "ip": "127.0.0.1",
+    "port": 8765
+  }
+}

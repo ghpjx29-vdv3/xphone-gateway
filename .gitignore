@@ -4,3 +4,5 @@ __pycache__/
 gateway/proxy.env
 gateway/health.json
 gateway/*.log
+runtime/node_modules/
+runtime/.wrangler/

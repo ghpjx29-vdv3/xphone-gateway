@@ -1,0 +1,18 @@
+{
+  "packId": "xphone-agent-blank",
+  "kind": "blank",
+  "xphoneSha256": "f844a70ab9703ce8c16fa94e3e9d1dbda9ddb1eb9614905879fc877a5098d0a5",
+  "version": "1.0.0",
+  "releaseStatus": "ready",
+  "language": "zh",
+  "locale": "zh-CN",
+  "runtimeAssets": [
+    {
+      "path": "story/config/agent.md",
+      "objectKey": "packs/xphone-agent-blank/runtime/story/config/agent.md",
+      "sha256": "aae38cf84b4af0b179897c112d43dd7e76f6d077889eae80c5ea9da1d3053e18"
+    }
+  ],
+  "documents": [],
+  "referenceAssets": []
+}

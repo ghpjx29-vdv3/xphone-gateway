@@ -1,0 +1,11 @@
+{
+  "name": "xphone-local-runtime",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "wrangler": "4.155.0"
+  }
+}

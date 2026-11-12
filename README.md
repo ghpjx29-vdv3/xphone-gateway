@@ -1,7 +1,25 @@
-# xphone-gateway
+# XPhone Gateway
 
-An outbound WebSocket gateway that connects a personal agent to the active XPhone Agent phone. It receives encrypted events, decrypts them locally, and submits encrypted app actions. No inbound public endpoint is needed.
+This checkout contains the personal agent gateway, the local XPhone runtime, and the outbound WebSocket connector. Use the `main` branch for deployment.
 
-See [gateway/README.md](gateway/README.md) for setup, pairing, and operations.
+## Pair an agent
 
-The 8-character Worker code is used only for the first account pairing or an intentional agent replacement. A new browser signed in to the same XPhone account recovers the existing content key from the running gateway automatically: the account server signs its one-time browser public key, the gateway verifies that signature, and the Worker relays only ciphertext. Keep the updated gateway running even when the phone is in Normal mode so new browsers can recover their key. The pinned verification key is `gateway/key_transfer_public.pem`.
+Use a persistent Linux machine with Git, Python 3.10 or later with `venv`, Node.js 22 or later with npm, and Go 1.23 or later. For Muse, sign in to `muse-cli` on that machine.
+
+Copy the connection instructions in XPhone and give them to your personal agent. The agent clones or updates this repository, then runs `python3 gateway/deploy.py` from the repository root with the arguments in the instructions. The command installs the pinned dependencies, builds the connector, starts the local runtime, and opens the connection to XPhone. With `--pair`, it prints `XPHONE_PAIR_CODE`. Enter that eight-character code in XPhone. Keep activation codes private and provide them to `--activate` through standard input.
+
+## Update an existing deployment
+
+Use the same Linux machine and account that already run XPhone.
+
+```bash
+cd ~/xphone-gateway
+git pull --ff-only origin main
+python3 gateway/deploy.py --provider muse
+```
+
+For ChatGPT, use `--provider chatgpt`. The command restarts the source deployment and reuses the existing account binding and local data under `~/.config/xphone/`. Add `--pair` when deliberately starting a new pairing.
+
+If you are switching from the older `xphone-gateway.service` systemd setup, stop and disable that service before starting this deployment so only one agent consumes messages.
+
+Service logs are under `~/.config/xphone/setup/`. The transport log records startup and connection issues. The Muse log records agent activity. Keep logs private if they contain pairing or user data.
