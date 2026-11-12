@@ -23,104 +23,11 @@ Gateway 常驻在 Muse VM，主动连上 XPhone Worker 的 Agent WS。Worker 先
 └──────────────────────────────────────────────┘
 ```
 
-## 一键接入（推荐）
+## 部署与配对
 
-用户只需要对自己的个人代理说一句话：
+在 XPhone 的「个人代理」页复制连接指令并发给代理。代理从 Git 的 `main` 拉取源码并运行 `gateway/deploy.py`，启动网关、本地运行时和连接器，再把生成的 8 位配对码发给用户。用户在 XPhone 中输入配对码并确认，代理自动保存凭证。
 
-> 帮我部署 github.com/ghpjx29-vdv3/xphone-gateway 并连接 xphone
-
-个人代理读完本节后全自动完成下面所有步骤。前端「个人代理」页输入 8 位配对码；
-凭证由配对程序安全接收并保存，不需要手动复制令牌或内容密钥。
-
-### 个人代理执行清单
-
-0. **平台检查**：`uname -s` 应为 Linux 且 `systemctl` 可用；否则停止并告诉用户
-   "一期只支持 Linux+systemd，你的系统是 <xx>，暂不支持"。
-1. **取代码**：`git clone <repo> ~/xphone-gateway`（目录已存在则 `git pull` 更新）；
-   通读本 README。
-2. **装依赖**：把仓库的 `gateway/` 内容同步到 `~/xphone/gateway/`，再在目标目录执行 `python3 -m venv .venv && .venv/bin/pip install cryptography`。Muse provider 还需在 VM 安装并登录 `muse-cli`。
-   （Python 3.10+；加解密必须用该 venv 的 python，系统 python 没有 cryptography）。
-3. **配对换取凭证（统一 8 位配对码）**：
-   在目标目录执行 `.venv/bin/python pair.py`。
-   终端将输出 8 位配对码（例如 `3EY64LSN`，有效期 5 分钟）。
-   代理将该 8 位配对码告诉用户，让用户在 XPhone / GIGI 手机前端的「个人代理」页输入并点击确认配对。
-4. **自动落盘凭证**：
-   用户在前端确认后，`pair.py` 自动从 `/pair/redeem` 完成兑换并用本地私钥解密，将凭证写入：
-    - `~/.config/xphone/content-keys/` 下当前存档的内容解密密钥（chmod 600）
-   - `~/.config/xphone/account.token`（账号 Bearer 令牌，chmod 600）
-   用户和代理全程无需手工复制粘贴长密钥。
-5. **配置 MCP 客户端（connector）**：
-   - **推荐路径（Muse VM 本地连接器）**：VM 本地连接器脚本直接从 `~/.config/xphone/account.token` 读取 Bearer Token（或由 Gateway `/account/gateway-session` 派发），无需手动配 API Key。
-   - **平台路径（第三方平台 / Muse 平台连接器）**：平台 OAuth2 可用时，按照平台显示的授权码在 XPhone「个人代理」页授权已配对的存档。Muse 平台 OAuth2 暂不可用时，用户在配对页选中 Muse 存档并点击「复制 MCP API Key」，自行粘贴到 Muse 连接器的 API key 输入框。
-6. **起常驻网关**：先用 `sudo env HOME=/home/hatch wss_proxy="${https_proxy:-${HTTPS_PROXY:-}}" "$(command -v muse-cli)" status` 确认服务所用的 HOME 和 Muse CLI 可连接，再从 `~/xphone/gateway/` 执行 `sudo cp xphone-gateway.service /etc/systemd/system/ &&
-   sudo systemctl daemon-reload && sudo systemctl enable --now xphone-gateway`
-   （已安装则为重装+重启）。服务模板选择 Muse provider；如需出站代理，先配好 `proxy.env`。若 systemd 找不到 CLI，在该文件写入 `XPHONE_MUSE_CLI=/绝对路径/muse-cli`。将 Hook 脚本同步到 `~/hooks/scripts/xphone-inbox.sh`，并通过 Muse 的 Hook 管理工具把已注册 Hook 的 `poll_interval_secs` 更新为 600；只复制 JSON 文件不会更新已注册配置。
-7. **装 watchdog**：按「运行与自愈」把 `watchdog.sh` 加入定时任务（每 10 分钟）。
-   （云主机约每 2 小时被回收一次，watchdog 检查进程与连接健康时间并恢复；重启后重新拉取服务端未确认事件。）
-8. **验证**：`~/xphone/gateway/gateway.log` 应出现取票成功、WS 已连接、`inbox write` 和 `muse event completed`。Gateway 通过专用会话负责事件领取、续租与完成。
-9. **冒泡测试**（必须做）：用 `submit_actions.py --pack-id <packId> --playthrough-id <playthroughId>` 提交一条 `agent.reply` 测试消息
-   （`messageId`=`bubble-<时间戳>` 唯一，`text`=`🫧 冒泡测试：网关链路正常`，
-   `messageType`=`text`，`role`=`os-agent`）；用 `xphone.get_delivery` 复核该 batchId
-   到 `applied`（最多等 2 分钟）。成功后告诉用户：去 XPhone 前端个人代理对话里看，
-   应该能看到这条测试消息——**看到即全链路打通**
-   （认证→取票→WS→加密提交→applied→客户端渲染）。
-10. **汇报**：成功用 3-5 句话说明做了什么、网关状态、测试消息已发出；
-    失败则明确说卡在哪一步、原始错误是什么、需要用户提供什么。
-    **绝不编造"成功"，不确定就说不确定。**
-
-### 重新配对/更换代理
-
-需要更换密钥或重置存档时：在 VM 重新运行 `.venv/bin/python pair.py`，让用户在前端确认配对码；完成后执行 `sudo systemctl restart xphone-gateway` 并复核验证。
-### 执行中必须遵守
-
-严格遵守「关键协议细节」第 1-8 条，尤其是：
-不带 `Origin` 头、UA 用 `XPhone-Gateway/1.0`、ticket 一次性 60 秒有效、
-单存档同时只允许一个 Agent WS（报 409 先停旧网关，不要硬连）、
-`accepted ≠ applied`（必须 `get_delivery` 复核）。
-
-## 前置条件
-
-- Python 3.10+，`pip install cryptography`
-- 运行 `pair.py` 通过 8 位配对码在 XPhone / GIGI 前端完成配对
-- 出站网络（本项目在需要 HTTP 代理的环境测试通过，见下方代理说明）
-
-## 安装
-
-```bash
-git clone <repo> ~/xphone-gateway
-mkdir -p ~/xphone/gateway
-cp -a ~/xphone-gateway/gateway/. ~/xphone/gateway/
-cd ~/xphone/gateway
-python3 -m venv .venv && .venv/bin/pip install cryptography
-
-# 1. 按上面的 8 位配对码流程运行 pair.py，自动保存当前存档的密钥
-.venv/bin/python pair.py
-
-# 2. 放代理配置（如需出站代理；不需要则留空文件）
-cp proxy.env.example proxy.env  # 按环境填写 https_proxy 等
-
-# 3. 安装 systemd 服务（模板在 xphone-gateway.service，按路径改）
-sudo cp xphone-gateway.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now xphone-gateway.service
-```
-
-MCP 令牌走各 Agent 平台自己的密钥机制（如 Muse 的 Secure Vault + connector），**不要**写进本仓库任何文件。
-
-### 已有 Muse VM 升级
-
-仓库更新后，把新代码和服务模板同步到原有的 `/home/hatch/xphone/gateway/`，保留该目录原有的 `proxy.env`、内容密钥和账号令牌：
-
-```bash
-cd ~/xphone-gateway && git pull
-cp -a gateway/. ~/xphone/gateway/
-cp hooks/xphone-inbox.sh ~/hooks/scripts/xphone-inbox.sh
-sudo cp ~/xphone/gateway/xphone-gateway.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl restart xphone-gateway
-```
-
-如果 `muse-cli` 不在 systemd 的 PATH，在原有 `~/xphone/gateway/proxy.env` 中添加 `XPHONE_MUSE_CLI=` 和 CLI 的绝对路径。通过 Muse 的 Hook 管理工具将已注册的 `xphone-inbox` 轮询间隔改为 600 秒；仅复制仓库中的 Hook JSON 不会修改已注册配置。发一条 XPhone 测试消息后，检查 Gateway 日志中的 `muse session created` 和 `muse event completed`，并确认客户端收到了动作。
+依赖、更新和重新配对见[仓库根目录的部署说明](../README.md)。
 
 ## 配置项
 
@@ -128,15 +35,14 @@ sudo systemctl restart xphone-gateway
 |---|---|---|
 | 内容密钥 | `~/.config/xphone/content-keys/` | 按 packId/playthroughId 索引的 base64url 32 字节密钥，0600；网关切换存档时加载 |
 | 代理 | `gateway/proxy.env` | `https_proxy`/`wss_proxy` 等，0600。Muse WSS 优先使用 `wss_proxy`，未设置时沿用 HTTPS 代理 |
-| provider | systemd 服务 / `proxy.env` | 服务模板设为 `muse`；其他个人代理可在 `proxy.env` 设 `XPHONE_PROVIDER=worker` 使用现有 worker 路径 |
+| 个人代理 | `gateway/deploy.py --provider` | 选择 XPhone 配对页对应的 Muse 或 ChatGPT |
 | Muse CLI | Muse VM | 登录凭证只保存在该 VM；`XPHONE_MUSE_CLI` 可指定可执行文件的绝对路径，不传给公共 Worker 或写入日志 |
 | MCP | Worker | Gateway 直连 MCP 使用 gateway session；Muse side chat 使用普通连接器凭证 |
 | 收件箱 | `~/xphone/inbox/` | 明文事件落地，worker 处理完删除，避免长期落盘 |
 
 ## 运行与自愈
 
-- `systemctl status xphone-gateway` 看状态；日志 `~/xphone/gateway/gateway.log`
-- **VM 会被替换**：`/etc` 是易失的，云主机替换后 systemd unit 会消失。配套 `watchdog.sh` + 定时任务（每 10 分钟）检查进程和最近健康时间；成功拉取、WebSocket pong 或普通手机模式检查都会更新健康时间。超过 5 分钟无健康信号时从 `xphone-gateway.service` 模板重装或重启。网关每次从服务端未确认队列的起点重扫，缺失的本地文件会重新生成。
+- 启动和连接日志位于 `~/.config/xphone/setup/`。网关断线后重连，并从服务端继续处理未确认的事件。
 - **Muse 事件分发**：Gateway 按服务端 cursor 串行处理；OS 用户对话与角色私聊各有固定 side chat，OS 后台事件使用临时 side chat。映射、固定 batchId 与重试时间写在 `muse-dispatch.json`，共享摘要写在 `muse-memory.json`。失败按 30 秒起、最长 10 分钟退避；收到 `queued` 继续等待，只有客户端 `applied` 才确认事件。租约由独立线程每 30 秒续期，Hook 每 10 分钟检查一次作为故障兜底。
 - **云电脑内容树**：首次连接 pack 时，Gateway 从 MCP 拉取 manifest、全部故事文档、角色 prompt 与动作清单，在 `~/xphone/content/{packId}/` 建立 `docs/`、`prompts/` 和 `{playthroughId}/tasks/delegations/`、`{playthroughId}/tasks/events/`、`{playthroughId}/memory/`。`prompts/` 包含 `tool-reminder.md`、`delegation-inject.md` 和 `app-actions.json`；`memory/` 初始化 `summary.md`、`pins.md`。后续旁聊按本轮给出的绝对路径直接读取这些文件。
 - **派工与动作文件**：OS 在 `tasks/delegations/{eventId}/{uuid4}.md` 写封闭词表中的目标与自然语言任务，再调用 `xphone.delegate_task({"taskPath":"文档绝对路径"})`。subagent 在同目录写同名 `.actions.json` 语义动作数组，再调用 `xphone.submit_task_actions({"taskPath":"原任务文档绝对路径"})`。OS 自身回复和 Journal 使用 Gateway 创建的 `tasks/events/{eventId}/{eventId}.md`，同样写同名动作文件并只提交任务路径。Worker 只转发路径；Gateway 查派工或事件状态，生成 header 并加密正文。接收确认不代表完成，客户端 `applied` 后摘要才写入 ledger。
@@ -152,9 +58,9 @@ sudo systemctl restart xphone-gateway
 
 ```cron
 CRON_TZ=Asia/Taipei
-*/30 * * * * HOME=/home/hatch /home/hatch/xphone/gateway/.venv/bin/python /home/hatch/xphone/gateway/agent_maintenance.py experience >> /home/hatch/xphone/gateway/maintenance.log 2>&1
-10 4,12,20 * * * HOME=/home/hatch /home/hatch/xphone/gateway/.venv/bin/python /home/hatch/xphone/gateway/agent_maintenance.py inspiration >> /home/hatch/xphone/gateway/maintenance.log 2>&1
-5 4 * * * HOME=/home/hatch /home/hatch/xphone/gateway/.venv/bin/python /home/hatch/xphone/gateway/agent_maintenance.py memory >> /home/hatch/xphone/gateway/maintenance.log 2>&1
+*/30 * * * * HOME=/home/hatch /home/hatch/.config/xphone/venv/bin/python /home/hatch/xphone-gateway/gateway/agent_maintenance.py experience >> /home/hatch/.config/xphone/setup/maintenance.log 2>&1
+10 4,12,20 * * * HOME=/home/hatch /home/hatch/.config/xphone/venv/bin/python /home/hatch/xphone-gateway/gateway/agent_maintenance.py inspiration >> /home/hatch/.config/xphone/setup/maintenance.log 2>&1
+5 4 * * * HOME=/home/hatch /home/hatch/.config/xphone/venv/bin/python /home/hatch/xphone-gateway/gateway/agent_maintenance.py memory >> /home/hatch/.config/xphone/setup/maintenance.log 2>&1
 ```
 
 定时任务要继承 Muse CLI 登录环境及出站代理。`agent_maintenance.py` 使用 `XPHONE_MUSE_CLI` 指定的 CLI 路径；未设置时使用 `/home/hatch/.local/bin/muse-cli`。
@@ -186,12 +92,6 @@ CRON_TZ=Asia/Taipei
 - `avatar_sync.py` — 推送 Muse 头像（静态图+状态动画）给 Worker，客户端加载为个人代理形象（需 Worker 实现 `xphone.set_agent_profile`）
 - `xphone-gateway.service` — systemd unit 模板
 - `proxy.env` — 出站代理（示例值按环境改）
-
-## 打包说明（给维护者）
-
-- npm 包形态建议：Node 包装层 + 预编译/内嵌 Python 网关，或纯 Node 重写 `wsclient` 逻辑（握手细节见上）。Python 依赖只有 `cryptography`（`websocket-client` 已不再需要）。
-- 密钥与令牌永远不进包、不进日志、不进错误信息。
-- 对外文档只讲"如何连上自己的 XPhone"，不涉及任何具体用户的 packId/playthroughId/密钥。
 
 ## 地图 MCP 接口规划（设计中，Worker 侧待实现）
 
