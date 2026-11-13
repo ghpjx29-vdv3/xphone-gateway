@@ -103,8 +103,10 @@ def catalog_server(binding):
         deadline = time.monotonic() + 40
         while total is None or len(content) < total:
             offset = len(content)
-            request = Request(endpoint, data=json.dumps({"key": key, "offset": offset, "version": version}).encode(),
-                              headers=headers)
+            query = {"key": key, "offset": offset}
+            if offset:
+                query["version"] = version
+            request = Request(endpoint, data=json.dumps(query).encode(), headers=headers)
             remaining = deadline - time.monotonic()
             if remaining <= 0 or failures >= 3:
                 raise TimeoutError("catalog transfer stalled")

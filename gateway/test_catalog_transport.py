@@ -30,7 +30,7 @@ class CatalogTransportTest(unittest.TestCase):
             def do_POST(self):
                 query = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 offset = query["offset"]
-                requests.append((offset, query["version"]))
+                requests.append(query)
                 chunk = expected[offset:offset + 8192]
                 self.send_response(206)
                 self.send_header("Content-Length", str(len(chunk)))
@@ -49,4 +49,9 @@ class CatalogTransportTest(unittest.TestCase):
                 request = Request(f"{catalog}/gateway/catalog-object?{query}", headers={"X-XPhone-Relay-Key": secret})
                 with urlopen(request, timeout=5) as response:
                     self.assertEqual(response.read(), expected)
-        self.assertEqual(requests[:3], [(0, None), (1093, "fixture"), (2186, "fixture")])
+        key = "packs/棠/manifest.json"
+        self.assertEqual(requests[:3], [
+            {"key": key, "offset": 0},
+            {"key": key, "offset": 1093, "version": "fixture"},
+            {"key": key, "offset": 2186, "version": "fixture"},
+        ])
