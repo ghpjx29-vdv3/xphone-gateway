@@ -204,6 +204,17 @@ class Delegation:
         actions = json.loads(action_path.read_text(encoding="utf-8"))
         if not isinstance(actions, list) or not actions:
             raise ValueError("动作文件必须是非空 JSON 动作数组；不要填写 batchId 等路由字段")
+        for action in actions:
+            if action.get("type") != "journal.appendMainRecord":
+                continue
+            options = action.get("options")
+            if not isinstance(options, list) or len(options) != 3 or any(
+                not isinstance(option, dict)
+                or type(option.get("index")) is not int or option["index"] != index
+                or not isinstance(option.get("text"), str) or not option["text"].strip()
+                for index, option in enumerate(options, 1)
+            ):
+                raise ValueError("journal.appendMainRecord 必须提供 options：按顺序填写 index 为 1、2、3 的三个选项，text 不能为空。请修改动作文件后重新提交。")
         header = {"batchId": batch, "parentEventId": event_id, "step": step,
                   "targetApp": route.get("targetApp") or ("journal" if event and parent["decrypted"].get("type") == "journal.main_record.requested" else "agent"),
                   "surfaceId": route.get("surfaceId") or ("journal.main_record" if event and parent["decrypted"].get("type") == "journal.main_record.requested" else "agent.reply"),

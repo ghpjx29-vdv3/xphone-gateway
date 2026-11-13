@@ -139,10 +139,18 @@ class DelegationTests(unittest.TestCase):
             root.mkdir(parents=True)
             task = root / f"{event_id}.md"
             task.write_text("任务: 写日记", encoding="utf-8")
-            task.with_suffix(".actions.json").write_text(
-                json.dumps([{"type": "journal.appendMainRecord", "markdown": "# 今夜"}]), encoding="utf-8")
-            prepared = Delegation(dispatcher, base / "content").prepare_actions(
-                str(task), "pack", "play", b"a" * 32)
+            action_file = task.with_suffix(".actions.json")
+            action = {"type": "journal.appendMainRecord", "markdown": "# 今夜"}
+            delegation = Delegation(dispatcher, base / "content")
+            valid = [{"index": index, "text": f"行动 {index}"} for index in range(1, 4)]
+            for fields in ({}, {"options": valid[:2]}, {"options": [*valid[:2], {"index": 2, "text": "行动"}]},
+                           {"options": [*valid[:2], {"index": 3, "text": "  "}]}):
+                with self.subTest(fields=fields):
+                    action_file.write_text(json.dumps([{**action, **fields}]), encoding="utf-8")
+                    with self.assertRaisesRegex(ValueError, "options"):
+                        delegation.prepare_actions(str(task), "pack", "play", b"a" * 32)
+            action_file.write_text(json.dumps([{**action, "options": valid}]), encoding="utf-8")
+            prepared = delegation.prepare_actions(str(task), "pack", "play", b"a" * 32)
             self.assertEqual(prepared["envelope"]["header"]["origin"], "event")
             self.assertEqual(prepared["envelope"]["header"]["batchId"], batch)
             self.assertEqual(prepared["frame"]["phase"], "start")
