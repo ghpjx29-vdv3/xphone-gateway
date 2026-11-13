@@ -8,7 +8,7 @@ export type RuntimeObjects = ReadableObjects & Pick<R2Bucket, 'put'>;
 
 async function readCatalogObject(url: URL, relayKey: string): Promise<Response> {
   const request = () => fetch(url, {
-    redirect: 'manual', signal: AbortSignal.timeout(10_000),
+    redirect: 'manual', signal: AbortSignal.timeout(45_000),
     headers: { 'x-xphone-relay-key': relayKey },
   });
   try {

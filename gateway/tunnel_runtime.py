@@ -4,6 +4,7 @@
 import argparse
 import getpass
 import hmac
+from http.client import IncompleteRead
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
@@ -91,6 +92,58 @@ def catalog_server(binding):
             return None
 
     opener = build_opener(NoRedirect)
+    manifests = {}
+    manifest_lock = threading.Lock()
+
+    def read_object(key):
+        content = bytearray()
+        version = None
+        total = None
+        failures = 0
+        deadline = time.monotonic() + 40
+        while total is None or len(content) < total:
+            offset = len(content)
+            request = Request(endpoint, data=json.dumps({"key": key, "offset": offset, "version": version}).encode(),
+                              headers=headers)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or failures >= 3:
+                raise TimeoutError("catalog transfer stalled")
+            try:
+                with opener.open(request, timeout=min(8, remaining)) as response:
+                    if response.status == 200 and offset == 0:
+                        return response.read()
+                    match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", response.headers.get("Content-Range", ""))
+                    current_version = response.headers.get("X-XPhone-Object-Version")
+                    if response.status != 206 or not match or not current_version:
+                        raise ValueError("invalid catalog range")
+                    start, end, size = map(int, match.groups())
+                    if start != offset or not start <= end < size or (version is not None and (current_version != version or size != total)):
+                        raise ValueError("catalog range does not match requested object")
+                    version, total = current_version, size
+                    try:
+                        part = response.read()
+                    except IncompleteRead as error:
+                        part = error.partial
+                    if len(part) > end - start + 1:
+                        raise ValueError("invalid catalog range length")
+                    content.extend(part)
+            except HTTPError:
+                raise
+            except (IncompleteRead, URLError, TimeoutError, OSError):
+                pass
+            failures = 0 if len(content) > offset else failures + 1
+        return content
+
+    def catalog_object(key):
+        if not key.endswith("/manifest.json"):
+            return read_object(key)
+        with manifest_lock:
+            cached = manifests.get(key)
+            if cached and cached[0] > time.monotonic():
+                return cached[1]
+            content = read_object(key)
+            manifests[key] = (time.monotonic() + 15, content)
+            return content
 
     class CatalogRequest(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -103,15 +156,13 @@ def catalog_server(binding):
             if len(keys) != 1 or len(keys[0]) > 512:
                 self.send_error(400)
                 return
-            request = Request(endpoint, data=json.dumps({"key": keys[0]}).encode(), headers=headers)
             try:
-                with opener.open(request, timeout=10) as response:
-                    content = response.read()
+                content = catalog_object(keys[0])
             except HTTPError as error:
                 print(f"XPhone catalog upstream returned HTTP {error.code}", file=sys.stderr, flush=True)
                 self.send_error(error.code)
                 return
-            except (URLError, TimeoutError, OSError) as error:
+            except (URLError, TimeoutError, OSError, ValueError) as error:
                 print(f"XPhone catalog request failed: {type(error).__name__}", file=sys.stderr, flush=True)
                 self.send_error(502)
                 return
