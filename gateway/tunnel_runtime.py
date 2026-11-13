@@ -16,7 +16,7 @@ import threading
 import time
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, build_opener
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 from urllib.request import Request, urlopen
 
 CONFIG = Path.home() / ".config" / "xphone" / "tunnel.json"
@@ -93,20 +93,22 @@ def catalog_server(binding):
     opener = build_opener(NoRedirect)
 
     class CatalogRequest(BaseHTTPRequestHandler):
-        def do_POST(self):
+        def do_GET(self):
+            url = urlsplit(self.path)
             supplied = self.headers.get("X-XPhone-Relay-Key", "")
-            if self.path != "/gateway/catalog-object" or not hmac.compare_digest(supplied, binding["relaySecret"]):
+            if url.path != "/gateway/catalog-object" or not hmac.compare_digest(supplied.encode(), binding["relaySecret"].encode()):
                 self.send_error(404)
                 return
-            length = self.headers.get("Content-Length", "")
-            if not length.isdecimal() or not 0 < int(length) <= 4096:
+            keys = parse_qs(url.query).get("key", [])
+            if len(keys) != 1 or len(keys[0]) > 512:
                 self.send_error(400)
                 return
-            request = Request(endpoint, data=self.rfile.read(int(length)), headers=headers)
+            request = Request(endpoint, data=json.dumps({"key": keys[0]}).encode(), headers=headers)
             try:
                 with opener.open(request, timeout=10) as response:
                     content = response.read()
             except HTTPError as error:
+                print(f"XPhone catalog upstream returned HTTP {error.code}", file=sys.stderr, flush=True)
                 self.send_error(error.code)
                 return
             except (URLError, TimeoutError, OSError) as error:
@@ -115,6 +117,7 @@ def catalog_server(binding):
                 return
             self.send_response(200)
             self.send_header("Content-Length", str(len(content)))
+            self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(content)
 
