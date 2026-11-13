@@ -1,3 +1,5 @@
+import type { ReadableObjects } from './catalogObjects';
+
 export interface MapPlace {
   placeId: string;
   fictionName: string;
@@ -17,7 +19,7 @@ interface MapPack {
   places: MapPlace[];
 }
 
-export async function readMapPack(bucket: R2Bucket, packId: string): Promise<MapPack> {
+export async function readMapPack(bucket: ReadableObjects, packId: string): Promise<MapPack> {
   let object = await bucket.get(`packs/${packId}/maps/places.json`);
   if (!object && (packId === 'xphone-agent-blank' || !packId)) {
     object = await bucket.get('packs/圣埃斯佩兰萨的棠-456f3930/maps/places.json');
@@ -26,7 +28,7 @@ export async function readMapPack(bucket: R2Bucket, packId: string): Promise<Map
   return object.json<MapPack>();
 }
 
-export async function mapFeatures(bucket: R2Bucket, featureManifest: { grid: number; bounds: number[]; tiles: Array<{ id: string; objectKey: string }> }, bbox: number[]): Promise<unknown> {
+export async function mapFeatures(bucket: ReadableObjects, featureManifest: { grid: number; bounds: number[]; tiles: Array<{ id: string; objectKey: string }> }, bbox: number[]): Promise<unknown> {
   const [west, south, east, north] = bbox;
   const grid = featureManifest.grid;
   const cells = new Set<string>();
@@ -189,7 +191,7 @@ async function optimize(data: MapPack, args: { placeIds: string[]; mode?: string
   return { order: ordered.map((item) => item.placeId), route: result };
 }
 
-export async function mapQuery(bucket: R2Bucket, packId: string, name: string, args: any): Promise<unknown> {
+export async function mapQuery(bucket: ReadableObjects, packId: string, name: string, args: any): Promise<unknown> {
   const data = await readMapPack(bucket, packId);
   switch (name) {
     case 'map.get_places': return { city: data.city, center: data.center, zoom: data.zoom, initialActors: data.initialActors || [],

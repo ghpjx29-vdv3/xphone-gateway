@@ -113,6 +113,29 @@ class MuseDispatchTests(unittest.TestCase):
         self.assertEqual(names.count("xphone.renew_event"), 2)
         self.assertEqual(names[-2:], ["xphone.finish_event", "xphone.ack_inbox"])
 
+    def test_applied_delegation_does_not_close_a_user_turn_without_its_reply(self):
+        self.record["route"] = {"role": "os-agent", "roleId": "osAgent:main", "consumer": "os",
+                                "surfaceId": "agent.reply"}
+        self.record["decrypted"]["type"] = "os.user_message"
+        (self.inbox / f"{self.event_id}.json").write_text(json.dumps(self.record), encoding="utf-8")
+        attempt = {"museStarted": True, "museSent": True, "failures": 0, "nextAt": 0}
+        self.dispatcher.state["events"][self.event_id] = attempt
+        event_status = {"status": "accepted", "delegationStatus": "applied"}
+
+        def mcp(name, args):
+            if name == "xphone.get_event_status":
+                return result(event_status)
+            return self.mcp(name, args)
+
+        self.dispatcher.dispatch([self.item], mcp, "play", pack_id="pack")
+        self.assertFalse(any(name in ("xphone.finish_event", "xphone.ack_inbox") for name, _ in self.calls))
+        self.assertTrue(attempt["waitingDelegations"])
+        self.status = "applied"
+        attempt["nextAt"] = 0
+        event_status.update(status="running", updatedAt=int(time.time() * 1000))
+        self.dispatcher.dispatch([self.item], mcp, "play", pack_id="pack")
+        self.assertEqual([name for name, _ in self.calls][-2:], ["xphone.finish_event", "xphone.ack_inbox"])
+
     def test_unknown_delivery_keeps_event_and_backoff(self):
         self.dispatcher.context.prompt = lambda *_, **__: "prompt"
         sent = []

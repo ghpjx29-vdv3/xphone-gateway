@@ -85,6 +85,7 @@ def run(args):
     variables = {
         "GRANT_HMAC_SECRET": binding["relaySecret"],
         "TOKEN_HMAC_SECRET": binding["relaySecret"],
+        "XPHONE_GATEWAY_ID": binding["gatewayId"],
         "XPHONE_GATEWAY_RELAY_SECRET": binding["relaySecret"],
         "XPHONE_RELAY_ORIGIN": binding["relayOrigin"],
         "CLIENT_ORIGINS": args.client_origins,

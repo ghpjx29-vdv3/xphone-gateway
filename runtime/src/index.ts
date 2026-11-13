@@ -1,5 +1,6 @@
 import { AgentConnection, type AgentEventRoute, type Direction, type SealedEnvelope } from './connection';
 import { actions } from './actionCatalog';
+import type { RuntimeObjects } from './catalogObjects';
 import { mapFeatures, mapQuery } from './mapData';
 import { eventCallbackUrl, eventSecret, sendWebhook, subscriptionId } from './mcpEvents';
 import { base64url, bearer, connectionName, randomId, sha256, signToken, verifyToken, type AccountClaims, type AccountGrantClaims, type AgentClaims, type GrantClaims, type OAuthClaims } from './security';
@@ -8,7 +9,7 @@ export { AgentConnection };
 
 interface Env {
   CONNECTIONS: DurableObjectNamespace;
-  AGENT_DOCUMENTS: R2Bucket;
+  AGENT_DOCUMENTS: RuntimeObjects;
   GRANT_HMAC_SECRET: string;
   TOKEN_HMAC_SECRET: string;
   CLIENT_ORIGINS: string;

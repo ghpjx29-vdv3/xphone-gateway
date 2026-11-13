@@ -357,6 +357,8 @@ class MuseDispatch:
                     if record["route"]["role"] == "os-agent":
                         current = delivery_status(mcp_call, batch)
                         if current == "unknown":
+                            if event_type == "os.user_message":
+                                raise AwaitingDelegations("waiting for the OS reply to be submitted")
                             outcome = self.delegation_outcome(event_id, attempt, mcp_call)
                             if outcome != "missing" or "无需联动" in reply_text:
                                 self.finish(item, record, mcp_call, lease_id, [], reply_text,
