@@ -3,6 +3,8 @@
 
 import argparse
 import getpass
+import hmac
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
@@ -10,7 +12,10 @@ import re
 import signal
 import subprocess
 import sys
+import threading
 import time
+from urllib.error import HTTPError, URLError
+from urllib.request import HTTPRedirectHandler, build_opener
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
@@ -74,6 +79,51 @@ def child_env(binding):
     }
 
 
+def catalog_server(binding):
+    endpoint = binding["relayOrigin"] + "/gateway/catalog-object"
+    headers = {
+        "Content-Type": "application/json", "User-Agent": "XPhone-Gateway/1.0",
+        "X-XPhone-Gateway-Id": binding["gatewayId"], "X-XPhone-Relay-Key": binding["relaySecret"],
+    }
+
+    class NoRedirect(HTTPRedirectHandler):
+        def redirect_request(self, *args):
+            return None
+
+    opener = build_opener(NoRedirect)
+
+    class CatalogRequest(BaseHTTPRequestHandler):
+        def do_POST(self):
+            supplied = self.headers.get("X-XPhone-Relay-Key", "")
+            if self.path != "/gateway/catalog-object" or not hmac.compare_digest(supplied, binding["relaySecret"]):
+                self.send_error(404)
+                return
+            length = self.headers.get("Content-Length", "")
+            if not length.isdecimal() or not 0 < int(length) <= 4096:
+                self.send_error(400)
+                return
+            request = Request(endpoint, data=self.rfile.read(int(length)), headers=headers)
+            try:
+                with opener.open(request, timeout=10) as response:
+                    content = response.read()
+            except HTTPError as error:
+                self.send_error(error.code)
+                return
+            except (URLError, TimeoutError, OSError) as error:
+                print(f"XPhone catalog request failed: {type(error).__name__}", file=sys.stderr, flush=True)
+                self.send_error(502)
+                return
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(content)))
+            self.end_headers()
+            self.wfile.write(content)
+
+        def log_message(self, *_args):
+            pass
+
+    return ThreadingHTTPServer(("127.0.0.1", 0), CatalogRequest)
+
+
 def run(args):
     binding = json.loads(CONFIG.read_text(encoding="utf-8"))
     runtime = Path(args.worker_repo).resolve()
@@ -82,10 +132,11 @@ def run(args):
         raise FileNotFoundError("Install the xphone-agent-worker runtime dependencies first")
     state = CONFIG.parent / "gateway-runtime"
     state.mkdir(mode=0o700, exist_ok=True)
+    catalog = catalog_server(binding)
     variables = {
         "GRANT_HMAC_SECRET": binding["relaySecret"],
         "TOKEN_HMAC_SECRET": binding["relaySecret"],
-        "XPHONE_GATEWAY_ID": binding["gatewayId"],
+        "XPHONE_CATALOG_ORIGIN": f"http://127.0.0.1:{catalog.server_port}",
         "XPHONE_GATEWAY_RELAY_SECRET": binding["relaySecret"],
         "XPHONE_RELAY_ORIGIN": binding["relayOrigin"],
         "CLIENT_ORIGINS": args.client_origins,
@@ -101,6 +152,7 @@ def run(args):
         raise SystemExit(0)
 
     signal.signal(signal.SIGTERM, stop)
+    threading.Thread(target=catalog.serve_forever, daemon=True).start()
     try:
         processes.append(subprocess.Popen([
             args.node, str(wrangler), "dev", "--config", "wrangler.gateway-local.jsonc",
@@ -114,6 +166,8 @@ def run(args):
             time.sleep(1)
         raise RuntimeError("XPhone connection stopped")
     finally:
+        catalog.shutdown()
+        catalog.server_close()
         for process in processes:
             if process.poll() is None:
                 process.terminate()

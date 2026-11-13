@@ -6,7 +6,7 @@ export { AgentConnection };
 type WorkerEnv = Parameters<typeof worker.fetch>[1];
 type Env = WorkerEnv & {
   AGENT_DOCUMENTS: R2Bucket;
-  XPHONE_GATEWAY_ID: string;
+  XPHONE_CATALOG_ORIGIN: string;
   XPHONE_GATEWAY_RELAY_SECRET: string;
   XPHONE_RELAY_ORIGIN: string;
 };
@@ -40,8 +40,8 @@ export default {
       const prefix = request.headers.get('x-xphone-public-prefix');
       if (prefix && /^\/g\/[a-f0-9-]{36}$/.test(prefix)) setGatewayPublicBase(forwarded, prefix);
       return await worker.fetch(forwarded, {
-        ...env, AGENT_DOCUMENTS: gatewayObjects(env.AGENT_DOCUMENTS, env.XPHONE_RELAY_ORIGIN,
-          env.XPHONE_GATEWAY_ID, env.XPHONE_GATEWAY_RELAY_SECRET),
+        ...env, AGENT_DOCUMENTS: gatewayObjects(env.AGENT_DOCUMENTS, env.XPHONE_CATALOG_ORIGIN,
+          env.XPHONE_GATEWAY_RELAY_SECRET),
       });
     } catch {
       return Response.json({ error: 'Gateway request failed' }, { status: 502 });

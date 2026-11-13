@@ -6,16 +6,15 @@ export interface ReadableObjects {
 
 export type RuntimeObjects = ReadableObjects & Pick<R2Bucket, 'put'>;
 
-export function gatewayObjects(bucket: R2Bucket, relayOrigin: string, gatewayId: string, relayKey: string): RuntimeObjects {
-  const endpoint = new URL('/gateway/catalog-object', relayOrigin);
+export function gatewayObjects(bucket: R2Bucket, catalogOrigin: string, relayKey: string): RuntimeObjects {
+  const endpoint = new URL('/gateway/catalog-object', catalogOrigin);
   return {
     async get(key) {
       const pack = /^packs\/([^/]+)\/(?:manifest\.json$|(?:documents|runtime|references|maps)\/)/.exec(key)?.[1];
       if (!pack || pack === 'xphone-agent-blank') return bucket.get(key);
       const response = await fetch(endpoint, {
-        method: 'POST', redirect: 'manual', signal: AbortSignal.timeout(10_000),
-        headers: { 'content-type': 'application/json', 'x-xphone-gateway-id': gatewayId,
-          'x-xphone-relay-key': relayKey, 'user-agent': 'XPhone-Gateway/1.0' },
+        method: 'POST', redirect: 'manual', signal: AbortSignal.timeout(12_000),
+        headers: { 'content-type': 'application/json', 'x-xphone-relay-key': relayKey },
         body: JSON.stringify({ key }),
       });
       if (response.status === 404) return null;
