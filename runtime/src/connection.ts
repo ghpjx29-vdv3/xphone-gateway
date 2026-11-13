@@ -600,7 +600,18 @@ export class AgentConnection implements DurableObject {
           this.state.acceptWebSocket(pair[1], ['client']);
           pair[1].serializeAttachment({ kind: 'client' });
           pair[1].send(JSON.stringify({ type: 'ready' }));
+          const gateway = this.state.getWebSockets('agent')[0];
+          if (gateway) {
+            const status = gateway.deserializeAttachment()?.preparation;
+            if (status) pair[1].send(JSON.stringify({ type: 'story-preparation', status }));
+          }
           return new Response(null, { status: 101, webSocket: pair[0], headers: { 'sec-websocket-protocol': `xphone-ticket.${ticket}` } });
+        }
+        case 'scope-changed': {
+          for (const socket of this.state.getWebSockets('agent')) {
+            try { socket.send(JSON.stringify({ type: 'scope-changed' })); } catch { /* closed connection */ }
+          }
+          return json({ ok: true });
         }
         case 'agent-socket': {
           for (const socket of this.state.getWebSockets()) {
@@ -883,8 +894,15 @@ export class AgentConnection implements DurableObject {
     if (message === 'ping') { socket.send('pong'); return; }
     if (socket.deserializeAttachment()?.kind !== 'agent' || typeof message !== 'string') return;
     let reply: SubmissionReply & { type?: string; requestId?: string; jobId?: string;
-      batchId?: string; step?: number; targetApp?: string; surfaceId?: string };
+      batchId?: string; step?: number; targetApp?: string; surfaceId?: string; status?: string };
     try { reply = JSON.parse(message); } catch { return; }
+    if (reply?.type === 'story-preparation' && ['preparing', 'ready', 'retrying'].includes(reply.status || '')) {
+      socket.serializeAttachment({ kind: 'agent', preparation: reply.status });
+      for (const client of this.state.getWebSockets('client')) {
+        try { client.send(JSON.stringify({ type: reply.type, status: reply.status })); } catch { /* closed connection */ }
+      }
+      return;
+    }
     if (reply?.type === 'submit-actions-ack' && reply.requestId) {
       this.submissionWaiters.get(reply.requestId)?.(reply);
       return;

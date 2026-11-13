@@ -102,6 +102,8 @@ class MuseContext:
                  f"事件：{EVENT_NAMES.get(event.get('type'), event.get('type') or '交办任务')}"]
         if current.get("stage"):
             lines.append(f"当前阶段：{STAGE_NAMES.get(current['stage'], current['stage'])}")
+        if event.get("playerName"):
+            lines.append("主控姓名（故事文档中的 {{user}}）：" + str(event["playerName"]))
         if latest:
             lines.append("用户这次说：")
             lines.extend(f"  {line}" for line in str(latest).splitlines())

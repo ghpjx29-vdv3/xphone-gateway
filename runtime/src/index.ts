@@ -682,8 +682,13 @@ async function client(request: Request, env: Env, path: string, origin: string |
     200, origin || undefined, env.CLIENT_ORIGINS);
   }
   if (path === '/client/active' && request.method === 'POST') {
-    await call(accountStub(env, claims.sub), 'account-active-set', { scope: body.active === false ? null
+    const account = accountStub(env, claims.sub);
+    const previous = (await call(account, 'account-active-get', {})).scope;
+    await call(account, 'account-active-set', { scope: body.active === false ? null
       : { packId: claims.packId, playthroughId: claims.playthroughId, xphoneSha256: claims.xphoneSha256 } });
+    if (previous && (body.active === false || previous.packId !== claims.packId || previous.playthroughId !== claims.playthroughId)) {
+      await call(stub(env, { sub: claims.sub, ...previous }), 'scope-changed', {});
+    }
     return response({ ok: true }, 200, origin || undefined, env.CLIENT_ORIGINS);
   }
   if (path === '/client/ticket' && request.method === 'POST') {

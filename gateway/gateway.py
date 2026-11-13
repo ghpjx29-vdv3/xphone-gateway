@@ -47,7 +47,7 @@ USER_AGENT = "XPhone-Gateway/1.0"
 PROVIDER = os.environ.get("XPHONE_PROVIDER", "worker")
 
 PING_INTERVAL = 30
-POLL_INTERVAL = 60
+POLL_INTERVAL = 5
 RECONNECT_BACKOFF = [5, 10, 30, 60]
 
 log = logging.getLogger("xphone-gateway")
@@ -292,9 +292,6 @@ class Gateway:
         self.session_token = pack_session["token"]
         self.mcp_url = pack_session["mcpUrl"]
         self.scope = pack_session["scope"]
-        if self.muse_dispatch:
-            await asyncio.to_thread(self.content_cache.sync, self.mcp_call,
-                                    self.scope["packId"], self.scope["playthroughId"])
         self._record_scope(self.scope, self.mcp_url)
         session_expires_at = pack_session["expiresAt"]
         log.info("minting event stream ticket")
@@ -332,6 +329,18 @@ class Gateway:
         # Pull immediately on (re)connect: the server does not reliably send
         # {"type":"ready"}, and the spec says to pull after notification/reconnect.
         try:
+            if self.muse_dispatch:
+                await ws.send_text(json.dumps({"type": "story-preparation", "status": "preparing"}))
+                try:
+                    await asyncio.to_thread(self.content_cache.sync, self.mcp_call,
+                                            self.scope["packId"], self.scope["playthroughId"])
+                except Exception:
+                    await ws.send_text(json.dumps({"type": "story-preparation", "status": "retrying"}))
+                    raise
+                selected = await asyncio.to_thread(active_scope)
+                if not selected or any(selected.get(key) != self.scope.get(key) for key in ("packId", "playthroughId")):
+                    return
+            await ws.send_text(json.dumps({"type": "story-preparation", "status": "ready"}))
             await asyncio.to_thread(self.pull_inbox)
             awaiting_pong = False
             next_delegation_check = time.monotonic()
@@ -379,6 +388,8 @@ class Gateway:
                 except ValueError:
                     continue
                 mtype = data.get("type")
+                if mtype == "scope-changed":
+                    break
                 if mtype == "ready":
                     log.info("received ready; pulling inbox")
                     await asyncio.to_thread(self.pull_inbox)

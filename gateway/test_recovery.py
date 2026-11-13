@@ -177,7 +177,8 @@ class RetainedInboxTests(unittest.TestCase):
         ):
             with self.assertRaises(gateway_module.WSClientError):
                 asyncio.run(self.gateway.run_once())
-        self.assertEqual(socket.sent, ["ping"])
+        self.assertEqual(json.loads(socket.sent[0]), {"type": "story-preparation", "status": "ready"})
+        self.assertEqual(socket.sent[1:], ["ping"])
         self.assertTrue(socket.closed)
         self.assertEqual(scope_check.call_count, 2)
 
