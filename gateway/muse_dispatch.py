@@ -138,9 +138,10 @@ class MuseDispatch:
         if not batch:
             return None
         receipt = self.inbox / f"receipt.{batch}.json"
-        if not receipt.exists():
+        try:
+            return json.loads(receipt.read_text(encoding="utf-8"))["decrypted"].get("reason")
+        except FileNotFoundError:
             return None
-        return json.loads(receipt.read_text(encoding="utf-8"))["decrypted"].get("reason")
 
     def on_receipt(self, batch: str) -> None:
         for attempt in self.state["events"].copy().values():
@@ -235,14 +236,15 @@ class MuseDispatch:
                 return
             event_id = item["envelope"]["id"]
             path = self.inbox / f"{event_id}.json"
-            if not path.exists():
+            try:
+                record = json.loads(path.read_text(encoding="utf-8"))
+            except FileNotFoundError:
                 continue
-            record = json.loads(path.read_text(encoding="utf-8"))
             if record["playthroughId"] != playthrough_id or record["packId"] != pack_id:
                 return
             if item["envelope"]["kind"] != "event":
                 mcp_call("xphone.ack_inbox", {"cursor": item["cursor"]})
-                path.unlink()
+                path.unlink(missing_ok=True)
                 continue
             attempt = self.state["events"].setdefault(event_id, {"failures": 0, "nextAt": 0})
             if time.time() < attempt["nextAt"]:
@@ -259,7 +261,7 @@ class MuseDispatch:
             status = tool_data(mcp_call, "xphone.get_event_status", {"eventId": event_id})
             if status["status"] == "completed":
                 mcp_call("xphone.ack_inbox", {"cursor": item["cursor"]})
-                path.unlink()
+                path.unlink(missing_ok=True)
                 self.state["events"].pop(event_id, None)
                 self.save()
                 continue

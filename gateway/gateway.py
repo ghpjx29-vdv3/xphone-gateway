@@ -48,6 +48,7 @@ PROVIDER = os.environ.get("XPHONE_PROVIDER", "worker")
 
 PING_INTERVAL = 30
 POLL_INTERVAL = 5
+INBOX_RETRY_INTERVAL = 5
 RECONNECT_BACKOFF = [5, 10, 30, 60]
 
 log = logging.getLogger("xphone-gateway")
@@ -237,10 +238,11 @@ class Gateway:
             grouped: dict[str, list] = {}
             for item in retained:
                 path = os.path.join(INBOX, f"{item['envelope']['id']}.json")
-                if not os.path.exists(path):
+                try:
+                    with open(path, encoding="utf-8") as f:
+                        record = json.load(f)
+                except FileNotFoundError:
                     continue
-                with open(path, encoding="utf-8") as f:
-                    record = json.load(f)
                 key = (self.muse_dispatch.session_key(record)[0]
                        if item["envelope"]["kind"] == "event" else f"receipt:{record['id']}")
                 grouped.setdefault(key, []).append(item)
@@ -262,18 +264,24 @@ class Gateway:
                             scope["playthroughId"], pack_id=scope["packId"], cancel=role_cancel,
                         )
                     except Exception as error:
-                        log.warning("muse dispatch deferred: error=%s", type(error).__name__)
-                    finally:
-                        role_lock.release()
+                        log.exception("muse dispatch deferred: error=%s", type(error).__name__)
                         with self._dispatch_lock_guard:
+                            if not role_cancel.is_set():
+                                self._dispatch_pending.add(role_key)
+                    finally:
+                        with self._dispatch_lock_guard:
+                            role_lock.release()
                             if role_cancel in self._dispatch_cancel:
                                 self._dispatch_cancel.remove(role_cancel)
-                            should_pull = role_key in self._dispatch_pending and not role_cancel.is_set()
-                        if should_pull:
-                            self.pull_inbox()
 
                 threading.Thread(target=dispatch_retained, daemon=True).start()
         self._record_health()
+
+    def take_pending_dispatch(self) -> bool:
+        with self._dispatch_lock_guard:
+            available = {key for key in self._dispatch_pending if not self._dispatch_locks[key].locked()}
+            self._dispatch_pending.difference_update(available)
+        return bool(available)
 
     async def run_once(self) -> None:
         scope = await asyncio.to_thread(active_scope)
@@ -328,6 +336,7 @@ class Gateway:
 
         # Pull immediately on (re)connect: the server does not reliably send
         # {"type":"ready"}, and the spec says to pull after notification/reconnect.
+        receive = None
         try:
             if self.muse_dispatch:
                 await ws.send_text(json.dumps({"type": "story-preparation", "status": "preparing"}))
@@ -343,20 +352,25 @@ class Gateway:
             await ws.send_text(json.dumps({"type": "story-preparation", "status": "ready"}))
             await asyncio.to_thread(self.pull_inbox)
             awaiting_pong = False
-            next_delegation_check = time.monotonic()
+            next_inbox_retry = time.monotonic() + INBOX_RETRY_INTERVAL
+            next_ping = time.monotonic() + PING_INTERVAL
+            receive = asyncio.create_task(ws.recv_text())
             while not self._stop.is_set():
                 if int(time.time() * 1000) + 60_000 >= session_expires_at:
                     log.info("pack session expiring; reconnecting")
                     break
-                if self.muse_dispatch and time.monotonic() >= next_delegation_check:
-                    next_delegation_check = time.monotonic() + PING_INTERVAL
-                    if any(attempt.get("waitingDelegations") and attempt["nextAt"] <= time.time()
-                           for attempt in self.muse_dispatch.state["events"].copy().values()):
+                timeout = max(0, min(next_inbox_retry, next_ping) - time.monotonic())
+                completed, _ = await asyncio.wait({receive}, timeout=timeout)
+                if time.monotonic() >= next_inbox_retry:
+                    next_inbox_retry = time.monotonic() + INBOX_RETRY_INTERVAL
+                    if self.muse_dispatch and (self.take_pending_dispatch() or any(
+                        attempt.get("nextAt") and attempt["nextAt"] <= time.time()
+                        for attempt in self.muse_dispatch.state["events"].copy().values()
+                    )):
                         await asyncio.to_thread(self.pull_inbox)
-                try:
-                    msg = await asyncio.wait_for(ws.recv_text(),
-                                                 timeout=PING_INTERVAL)
-                except asyncio.TimeoutError:
+                if not completed:
+                    if time.monotonic() < next_ping:
+                        continue
                     if awaiting_pong:
                         raise WSClientError("websocket pong timeout")
                     try:
@@ -369,16 +383,15 @@ class Gateway:
                         log.warning("active scope check failed: %s", scope_err)
                     await ws.send_text("ping")
                     awaiting_pong = True
+                    next_ping = time.monotonic() + PING_INTERVAL
                     self._record_health()
-                    if self.muse_dispatch and any(
-                        attempt.get("nextAt") and attempt["nextAt"] <= time.time()
-                        for attempt in self.muse_dispatch.state["events"].copy().values()
-                    ):
-                        await asyncio.to_thread(self.pull_inbox)
                     continue
+                msg = receive.result()
                 if msg is None:
                     log.info("server closed connection")
                     break
+                receive = asyncio.create_task(ws.recv_text())
+                next_ping = time.monotonic() + PING_INTERVAL
                 self._record_health()
                 if msg == "pong":
                     awaiting_pong = False
@@ -437,11 +450,15 @@ class Gateway:
                 else:
                     log.debug("unhandled message type: %s", mtype)
         finally:
+            if receive is not None:
+                receive.cancel()
+                await asyncio.gather(receive, return_exceptions=True)
             if PROVIDER == "muse":
                 with self._dispatch_lock_guard:
                     cancels = list(self._dispatch_cancel)
-                for cancel in cancels:
-                    cancel.set()
+                    for cancel in cancels:
+                        cancel.set()
+                    self._dispatch_pending.clear()
             await ws.close()
 
     async def run(self) -> None:
@@ -470,8 +487,7 @@ class Gateway:
                         break
                     wait = RECONNECT_BACKOFF[min(backoff_idx,
                                                  len(RECONNECT_BACKOFF) - 1)]
-                    log.warning("connection failed (%s); retry in %ss",
-                                type(e).__name__, wait)
+                    log.warning("connection failed (%s); retry in %ss", type(e).__name__, wait, exc_info=True)
                     backoff_idx += 1
                     try:
                         await asyncio.wait_for(self._stop.wait(), timeout=wait)

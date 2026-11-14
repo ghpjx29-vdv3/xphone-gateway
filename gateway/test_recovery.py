@@ -7,6 +7,7 @@ import tempfile
 import threading
 import time
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -124,6 +125,83 @@ class RetainedInboxTests(unittest.TestCase):
         while len(finished) < 2 and time.time() < deadline:
             time.sleep(0.01)
         self.assertEqual(set(finished), {'event-1', 'event-2'})
+
+    def test_inbox_scan_skips_a_file_removed_after_persisting(self):
+        items = [event(1), event(2)]
+        self.gateway.scope = {"playthroughId": "play", "packId": "pack"}
+        self.gateway.session_token = "token"
+        self.gateway.mcp_url = "https://worker.example/mcp"
+        self.gateway.mcp_call = lambda _name, args: {
+            "content": [{"text": json.dumps({"items": items if args["cursor"] == 0 else []})}]
+        }
+        first_file = Path(self.inbox, "event-1.json")
+        real_open = open
+
+        def open_after_ack(path, *args, **kwargs):
+            if path == str(first_file) and kwargs.get("encoding") == "utf-8":
+                first_file.unlink()
+            return real_open(path, *args, **kwargs)
+
+        done = threading.Event()
+        dispatched = []
+
+        def dispatch(items, *_args, **_kwargs):
+            dispatched.extend(item["cursor"] for item in items)
+            done.set()
+
+        self.gateway.muse_dispatch = SimpleNamespace(dispatch=dispatch, session_key=lambda _record: ("role", False))
+        with patch.object(gateway_module, "PROVIDER", "muse"), patch("builtins.open", side_effect=open_after_ack):
+            self.gateway.pull_inbox()
+            self.assertTrue(done.wait(2))
+        self.assertEqual(dispatched, [2])
+
+    def test_main_loop_retries_an_inbox_dispatch_that_raised(self):
+        item = event(1)
+        scope = {"packId": "pack", "playthroughId": "play"}
+        self.gateway._stop = asyncio.Event()
+        self.gateway.mcp_call = lambda name, args: {
+            "content": [{"text": json.dumps(
+                {"ticket": "ticket", "connection": "connection"} if name == "xphone.open_event_stream"
+                else {"items": [item] if args["cursor"] == 0 else []}
+            )}]
+        }
+        attempts = []
+        done = threading.Event()
+
+        def dispatch(*_args, **_kwargs):
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise OSError("temporary inbox failure")
+            done.set()
+
+        self.gateway.muse_dispatch = SimpleNamespace(
+            dispatch=dispatch, session_key=lambda _record: ("role", False), state={"events": {}})
+        self.gateway.content_cache = SimpleNamespace(sync=lambda *_args: None)
+
+        class BusySocket:
+            async def connect(self):
+                pass
+
+            async def send_text(self, _value):
+                pass
+
+            async def recv_text(self):
+                await asyncio.sleep(0.001)
+                return None if done.is_set() else "pong"
+
+            async def close(self):
+                pass
+
+        with patch.object(gateway_module, "PROVIDER", "muse"), patch.object(
+            gateway_module, "INBOX_RETRY_INTERVAL", 0.01
+        ), patch.object(gateway_module, "WSClient", return_value=BusySocket()), patch.object(
+            gateway_module, "active_scope", return_value=scope
+        ), patch.object(gateway_module, "read_key", return_value=b"a" * 32), patch.object(
+            gateway_module, "session", return_value={"token": "token", "mcpUrl": "https://worker.example/mcp",
+                                                    "scope": scope, "expiresAt": 9999999999999}
+        ):
+            asyncio.run(asyncio.wait_for(self.gateway.run_once(), timeout=2))
+        self.assertEqual(len(attempts), 2)
 
     def test_bad_first_envelope_does_not_skip_later_events(self):
         self.gateway.decrypt_envelope = lambda envelope: (
