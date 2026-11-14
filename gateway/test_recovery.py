@@ -8,6 +8,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -60,6 +61,23 @@ class RetainedInboxTests(unittest.TestCase):
         self.gateway.delegation = None
         self.gateway.muse_dispatch = None
         self.gateway.scope = None
+
+    def test_concurrent_health_updates_replace_distinct_files(self):
+        ready = threading.Barrier(2)
+        replace = os.replace
+        replace_lock = threading.Lock()
+
+        def replace_together(source, target):
+            ready.wait(timeout=2)
+            with replace_lock:
+                replace(source, target)
+
+        with patch.object(gateway_module.os, "replace", side_effect=replace_together):
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                list(executor.map(lambda _: self.gateway._record_health(), range(2)))
+        health = Path(gateway_module.HEALTH_PATH)
+        self.assertIsInstance(json.loads(health.read_text(encoding="utf-8"))["lastHealthyAt"], int)
+        self.assertEqual(list(health.parent.glob("health.*.tmp")), [])
 
     def test_deleted_unacked_file_is_restored_on_next_pull(self):
         calls = []

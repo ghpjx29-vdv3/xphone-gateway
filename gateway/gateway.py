@@ -24,9 +24,11 @@ import logging
 import os
 import signal
 import sys
+import tempfile
 import threading
 import time
 import traceback
+from pathlib import Path
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from wsclient import WSClient, WSClientError
@@ -92,11 +94,16 @@ class Gateway:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     def _record_health(self) -> None:
-        os.makedirs(os.path.dirname(HEALTH_PATH), exist_ok=True)
-        tmp = HEALTH_PATH + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump({"lastHealthyAt": int(time.time())}, f)
-        os.replace(tmp, HEALTH_PATH)
+        directory = os.path.dirname(HEALTH_PATH)
+        os.makedirs(directory, exist_ok=True)
+        temporary = tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=directory,
+                                                prefix="health.", suffix=".tmp", delete=False)
+        try:
+            with temporary as f:
+                json.dump({"lastHealthyAt": int(time.time())}, f)
+            os.replace(temporary.name, HEALTH_PATH)
+        finally:
+            Path(temporary.name).unlink(missing_ok=True)
 
     def _record_scope(self, scope: dict | None, mcp_url: str | None) -> None:
         # Lets hook workers (and operators) see the current active pack
